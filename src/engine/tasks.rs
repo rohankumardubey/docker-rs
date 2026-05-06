@@ -21,6 +21,13 @@ pub fn refresh_images(sender: Sender<WorkerEvent>) {
     });
 }
 
+pub fn refresh_projects(sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let result = list_projects().map_err(|err| err.to_string());
+        let _ = sender.send(WorkerEvent::ProjectList(result));
+    });
+}
+
 pub fn inspect_image(image: String, sender: Sender<WorkerEvent>) {
     thread::spawn(move || {
         let result = inspect_image_entry(&image).map_err(|err| err.to_string());
@@ -134,6 +141,61 @@ pub fn build_image(
                 )
             })
             .map_err(|err| format!("Native build failed for `{tag}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn compose_project_up(
+    compose_target: String,
+    project_name: Option<String>,
+    sender: Sender<WorkerEvent>,
+) {
+    thread::spawn(move || {
+        let trimmed_target = compose_target.trim().to_owned();
+        let trimmed_project_name = project_name.and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        });
+        let result = compose_up_entry(&trimmed_target, trimmed_project_name.as_deref(), &sender)
+            .map(|name| format!("Compose project `{name}` is up."))
+            .map_err(|err| format!("Compose up failed for `{trimmed_target}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn compose_project_down(
+    compose_target: String,
+    project_name: Option<String>,
+    sender: Sender<WorkerEvent>,
+) {
+    thread::spawn(move || {
+        let trimmed_target = compose_target.trim().to_owned();
+        let trimmed_project_name = project_name.and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        });
+        let result = compose_down_entry(&trimmed_target, trimmed_project_name.as_deref(), &sender)
+            .map(|name| format!("Compose project `{name}` is down."))
+            .map_err(|err| format!("Compose down failed for `{trimmed_target}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn fetch_project_logs(
+    compose_target: String,
+    project_name: Option<String>,
+    sender: Sender<WorkerEvent>,
+) {
+    thread::spawn(move || {
+        let trimmed_target = compose_target.trim().to_owned();
+        let trimmed_project_name = project_name.and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        });
+        let result =
+            fetch_project_logs_entry(&trimmed_target, trimmed_project_name.as_deref(), &sender)
+                .map(|name| format!("Fetched logs for compose project `{name}`."))
+                .map_err(|err| format!("Compose logs failed for `{trimmed_target}`: {err}"));
         let _ = sender.send(WorkerEvent::ActionFinished(result));
     });
 }

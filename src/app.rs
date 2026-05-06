@@ -14,12 +14,13 @@ use eframe::egui;
 use self::helpers::*;
 use crate::engine::{
     self, ContainerDetailsInfo, ContainerInfo, ContainerStatsInfo, DockerImageInfo,
-    EngineStatusInfo, ImageDetailsInfo, RuntimeStatusInfo, WorkerEvent,
+    EngineStatusInfo, ImageDetailsInfo, ProjectInfo, RuntimeStatusInfo, WorkerEvent,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceTab {
     Home,
+    Projects,
     Containers,
     Images,
     Build,
@@ -67,11 +68,16 @@ pub struct DockerDesktopApp {
     exec_command_input: String,
     logs: Vec<String>,
     images: Vec<DockerImageInfo>,
+    projects: Vec<ProjectInfo>,
     containers: Vec<ContainerInfo>,
     image_filter: String,
+    project_filter: String,
     container_filter: String,
+    compose_target: String,
+    compose_project_name: String,
     live_log_stream_container: Option<String>,
     live_log_stop: Option<Arc<AtomicBool>>,
+    selected_project_name: Option<String>,
     selected_image_ref: Option<String>,
     selected_image_details: Option<ImageDetailsInfo>,
     selected_container_id: Option<String>,
@@ -118,11 +124,16 @@ impl DockerDesktopApp {
             exec_command_input: String::from("uname -a"),
             logs: vec![String::from("Docker RS Desktop native engine started.")],
             images: Vec::new(),
+            projects: Vec::new(),
             containers: Vec::new(),
             image_filter: String::new(),
+            project_filter: String::new(),
             container_filter: String::new(),
+            compose_target: String::new(),
+            compose_project_name: String::new(),
             live_log_stream_container: None,
             live_log_stop: None,
+            selected_project_name: None,
             selected_image_ref: None,
             selected_image_details: None,
             selected_container_id: None,
@@ -133,6 +144,7 @@ impl DockerDesktopApp {
         engine::check_engine_status(event_sender.clone());
         engine::check_runtime_status(event_sender.clone());
         engine::refresh_images(event_sender);
+        engine::refresh_projects(app.event_sender.clone());
         engine::refresh_containers(app.event_sender.clone());
 
         app
@@ -167,6 +179,22 @@ impl DockerDesktopApp {
                     }
                     Err(message) => {
                         self.logs.push(format!("Image refresh failed: {message}"));
+                    }
+                },
+                WorkerEvent::ProjectList(result) => match result {
+                    Ok(projects) => {
+                        if let Some(selected_name) = self.selected_project_name.as_ref() {
+                            if !projects
+                                .iter()
+                                .any(|project| &project.name == selected_name)
+                            {
+                                self.selected_project_name = None;
+                            }
+                        }
+                        self.projects = projects;
+                    }
+                    Err(message) => {
+                        self.logs.push(format!("Project refresh failed: {message}"));
                     }
                 },
                 WorkerEvent::ImageDetails(result) => match result {
@@ -238,6 +266,7 @@ impl DockerDesktopApp {
                             self.show_toast(message.clone(), ToastKind::Success);
                             self.logs.push(message);
                             engine::refresh_images(self.event_sender.clone());
+                            engine::refresh_projects(self.event_sender.clone());
                             engine::refresh_containers(self.event_sender.clone());
                             engine::check_runtime_status(self.event_sender.clone());
                             self.refresh_selected_image_details();
@@ -248,6 +277,7 @@ impl DockerDesktopApp {
                             self.show_toast(message.clone(), ToastKind::Error);
                             self.logs.push(message);
                             engine::refresh_images(self.event_sender.clone());
+                            engine::refresh_projects(self.event_sender.clone());
                             engine::refresh_containers(self.event_sender.clone());
                             engine::check_runtime_status(self.event_sender.clone());
                             self.refresh_selected_image_details();
@@ -316,6 +346,10 @@ impl DockerDesktopApp {
         engine::refresh_images(self.event_sender.clone());
     }
 
+    fn refresh_projects(&mut self) {
+        engine::refresh_projects(self.event_sender.clone());
+    }
+
     fn refresh_engine(&mut self) {
         self.logs
             .push(String::from("Refreshing native OCI engine state..."));
@@ -352,6 +386,11 @@ impl DockerDesktopApp {
             WorkspaceTab::Home => {
                 self.refresh_engine();
                 self.refresh_images();
+                self.refresh_projects();
+                self.refresh_runtime();
+            }
+            WorkspaceTab::Projects => {
+                self.refresh_projects();
                 self.refresh_runtime();
             }
             WorkspaceTab::Containers => self.refresh_runtime(),
@@ -359,6 +398,7 @@ impl DockerDesktopApp {
             WorkspaceTab::Build => {
                 self.refresh_engine();
                 self.refresh_images();
+                self.refresh_projects();
                 self.refresh_runtime();
             }
             WorkspaceTab::Logs => self.refresh_runtime(),
@@ -371,6 +411,7 @@ impl DockerDesktopApp {
         }
 
         let mut go_home = false;
+        let mut go_projects = false;
         let mut go_containers = false;
         let mut go_images = false;
         let mut go_build = false;
@@ -384,15 +425,18 @@ impl DockerDesktopApp {
                 go_home = true;
             }
             if command && input.key_pressed(egui::Key::Num2) {
-                go_containers = true;
+                go_projects = true;
             }
             if command && input.key_pressed(egui::Key::Num3) {
-                go_images = true;
+                go_containers = true;
             }
             if command && input.key_pressed(egui::Key::Num4) {
-                go_build = true;
+                go_images = true;
             }
             if command && input.key_pressed(egui::Key::Num5) {
+                go_build = true;
+            }
+            if command && input.key_pressed(egui::Key::Num6) {
                 go_logs = true;
             }
             if input.key_pressed(egui::Key::Escape) {
@@ -408,6 +452,9 @@ impl DockerDesktopApp {
         }
         if go_home {
             self.navigate_to(WorkspaceTab::Home);
+        }
+        if go_projects {
+            self.navigate_to(WorkspaceTab::Projects);
         }
         if go_containers {
             self.navigate_to(WorkspaceTab::Containers);
@@ -433,6 +480,95 @@ impl DockerDesktopApp {
     fn start_runtime(&mut self) {
         self.running_task = Some(String::from("Starting Docker runtime bridge"));
         engine::start_runtime(self.event_sender.clone());
+    }
+
+    fn effective_project_target(&self) -> Option<String> {
+        let target = self.compose_target.trim();
+        if !target.is_empty() {
+            return Some(target.to_string());
+        }
+
+        self.selected_project_name
+            .as_ref()
+            .and_then(|name| self.projects.iter().find(|project| &project.name == name))
+            .map(|project| primary_project_target(&project.config_files))
+            .filter(|target| !target.is_empty())
+    }
+
+    fn effective_project_name(&self) -> Option<String> {
+        let name = self.compose_project_name.trim();
+        if !name.is_empty() {
+            Some(name.to_string())
+        } else {
+            self.selected_project_name.clone()
+        }
+    }
+
+    fn select_project(&mut self, project: &ProjectInfo) {
+        self.selected_project_name = Some(project.name.clone());
+        self.compose_project_name = project.name.clone();
+        let target = primary_project_target(&project.config_files);
+        if !target.is_empty() {
+            self.compose_target = target;
+        }
+    }
+
+    fn start_compose_up(&mut self) {
+        let Some(target) = self.effective_project_target() else {
+            self.show_toast(
+                String::from("Compose up aborted: choose a compose file or project folder."),
+                ToastKind::Error,
+            );
+            self.logs.push(String::from(
+                "Compose up aborted: choose a compose file or project folder.",
+            ));
+            return;
+        };
+        let project_name = self.effective_project_name();
+        self.running_task = Some(format!(
+            "Starting compose project {}",
+            project_name.clone().unwrap_or_else(|| target.clone())
+        ));
+        engine::compose_project_up(target, project_name, self.event_sender.clone());
+    }
+
+    fn start_compose_down(&mut self) {
+        let Some(target) = self.effective_project_target() else {
+            self.show_toast(
+                String::from("Compose down aborted: choose a compose file or project folder."),
+                ToastKind::Error,
+            );
+            self.logs.push(String::from(
+                "Compose down aborted: choose a compose file or project folder.",
+            ));
+            return;
+        };
+        let project_name = self.effective_project_name();
+        self.running_task = Some(format!(
+            "Stopping compose project {}",
+            project_name.clone().unwrap_or_else(|| target.clone())
+        ));
+        engine::compose_project_down(target, project_name, self.event_sender.clone());
+    }
+
+    fn fetch_compose_logs(&mut self) {
+        let Some(target) = self.effective_project_target() else {
+            self.show_toast(
+                String::from("Compose logs aborted: choose a compose file or project folder."),
+                ToastKind::Error,
+            );
+            self.logs.push(String::from(
+                "Compose logs aborted: choose a compose file or project folder.",
+            ));
+            return;
+        };
+        let project_name = self.effective_project_name();
+        self.navigate_to(WorkspaceTab::Logs);
+        self.running_task = Some(format!(
+            "Fetching compose logs for {}",
+            project_name.clone().unwrap_or_else(|| target.clone())
+        ));
+        engine::fetch_project_logs(target, project_name, self.event_sender.clone());
     }
 
     fn start_run(&mut self) {

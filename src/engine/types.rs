@@ -38,6 +38,14 @@ pub struct ContainerInfo {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct ProjectInfo {
+    pub name: String,
+    pub status: String,
+    pub config_files: String,
+    pub working_dir: String,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct ContainerDetailsInfo {
     pub id: String,
     pub name: String,
@@ -93,6 +101,7 @@ pub enum WorkerEvent {
     EngineStatus(Result<EngineStatusInfo, String>),
     RuntimeStatus(Result<RuntimeStatusInfo, String>),
     ImageList(Result<Vec<DockerImageInfo>, String>),
+    ProjectList(Result<Vec<ProjectInfo>, String>),
     ImageDetails(Result<ImageDetailsInfo, String>),
     ContainerList(Result<Vec<ContainerInfo>, String>),
     ContainerDetails(Result<ContainerDetailsInfo, String>),

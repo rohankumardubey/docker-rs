@@ -29,15 +29,16 @@ mod tasks;
 mod types;
 
 pub use self::tasks::{
-    build_image, check_engine_status, check_runtime_status, exec_in_container,
-    fetch_container_logs, follow_container_logs, inspect_container, inspect_container_stats,
-    inspect_image, pull_image, refresh_containers, refresh_images, remove_container, remove_image,
+    build_image, check_engine_status, check_runtime_status, compose_project_down,
+    compose_project_up, exec_in_container, fetch_container_logs, fetch_project_logs,
+    follow_container_logs, inspect_container, inspect_container_stats, inspect_image, pull_image,
+    refresh_containers, refresh_images, refresh_projects, remove_container, remove_image,
     restart_container, run_container, start_container, start_runtime, stop_container,
 };
 use self::types::*;
 pub use self::types::{
     ContainerDetailsInfo, ContainerInfo, ContainerStatsInfo, DockerImageInfo, EngineStatusInfo,
-    ImageDetailsInfo, RuntimeStatusInfo, WorkerEvent,
+    ImageDetailsInfo, ProjectInfo, RuntimeStatusInfo, WorkerEvent,
 };
 
 fn engine_status() -> Result<EngineStatusInfo> {
@@ -249,6 +250,52 @@ fn runtime_status() -> Result<RuntimeStatusInfo> {
         native_ready: true,
         bridge_ready: bridge.is_some(),
     })
+}
+
+fn list_projects() -> Result<Vec<ProjectInfo>> {
+    let output = Command::new("docker")
+        .args(["compose", "ls", "--format", "json"])
+        .output()
+        .context("unable to query compose projects")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                String::from("Docker Compose project listing failed.")
+            } else {
+                stderr
+            }
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct DockerComposeLsRow {
+        #[serde(rename = "Name", alias = "name")]
+        name: String,
+        #[serde(rename = "Status", alias = "status")]
+        status: Option<String>,
+        #[serde(rename = "ConfigFiles", alias = "config_files")]
+        config_files: Option<String>,
+    }
+
+    let mut projects = parse_json_list::<DockerComposeLsRow>(&output.stdout)?
+        .into_iter()
+        .map(|row| {
+            let config_files = row.config_files.unwrap_or_default();
+            let target = primary_compose_target(&config_files);
+            ProjectInfo {
+                name: row.name,
+                status: row.status.unwrap_or_else(|| String::from("Unknown")),
+                working_dir: compose_target_working_dir(&target),
+                config_files,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    projects.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(projects)
 }
 
 fn list_containers() -> Result<Vec<ContainerInfo>> {
@@ -699,6 +746,117 @@ fn fetch_container_logs_entry(container_id: &str, sender: &Sender<WorkerEvent>) 
     }
 
     Ok(())
+}
+
+fn compose_up_entry(
+    compose_target: &str,
+    project_name: Option<&str>,
+    sender: &Sender<WorkerEvent>,
+) -> Result<String> {
+    let mut args = compose_command_args(compose_target, project_name)?;
+    args.extend([
+        String::from("up"),
+        String::from("-d"),
+        String::from("--remove-orphans"),
+    ]);
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "$ {}",
+        render_command("docker", &args)
+    )));
+
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .context("unable to run docker compose up")?;
+
+    emit_command_output(sender, &output);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                String::from("docker compose up failed")
+            } else {
+                stderr
+            }
+        );
+    }
+
+    Ok(compose_project_display_name(compose_target, project_name))
+}
+
+fn compose_down_entry(
+    compose_target: &str,
+    project_name: Option<&str>,
+    sender: &Sender<WorkerEvent>,
+) -> Result<String> {
+    let mut args = compose_command_args(compose_target, project_name)?;
+    args.extend([String::from("down"), String::from("--remove-orphans")]);
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "$ {}",
+        render_command("docker", &args)
+    )));
+
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .context("unable to run docker compose down")?;
+
+    emit_command_output(sender, &output);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                String::from("docker compose down failed")
+            } else {
+                stderr
+            }
+        );
+    }
+
+    Ok(compose_project_display_name(compose_target, project_name))
+}
+
+fn fetch_project_logs_entry(
+    compose_target: &str,
+    project_name: Option<&str>,
+    sender: &Sender<WorkerEvent>,
+) -> Result<String> {
+    let mut args = compose_command_args(compose_target, project_name)?;
+    args.extend([
+        String::from("logs"),
+        String::from("--tail"),
+        String::from("200"),
+        String::from("--no-color"),
+    ]);
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "$ {}",
+        render_command("docker", &args)
+    )));
+
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .context("unable to fetch docker compose logs")?;
+
+    emit_command_output(sender, &output);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                String::from("docker compose logs failed")
+            } else {
+                stderr
+            }
+        );
+    }
+
+    Ok(compose_project_display_name(compose_target, project_name))
 }
 
 fn follow_container_logs_entry(
@@ -1696,6 +1854,106 @@ fn render_command(program: &str, args: &[String]) -> String {
     parts.push(program.to_string());
     parts.extend(args.iter().cloned());
     parts.join(" ")
+}
+
+fn compose_command_args(compose_target: &str, project_name: Option<&str>) -> Result<Vec<String>> {
+    let target = compose_target.trim();
+    if target.is_empty() {
+        bail!("compose file or project folder is required");
+    }
+
+    let target_path = PathBuf::from(target);
+    let mut args = vec![String::from("compose")];
+    if target_path.is_dir() {
+        args.push(String::from("--project-directory"));
+        args.push(target.to_string());
+    } else {
+        args.push(String::from("-f"));
+        args.push(target.to_string());
+        if let Some(parent) = target_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            args.push(String::from("--project-directory"));
+            args.push(parent.display().to_string());
+        }
+    }
+
+    if let Some(name) = project_name.map(str::trim).filter(|name| !name.is_empty()) {
+        args.push(String::from("-p"));
+        args.push(name.to_string());
+    }
+
+    Ok(args)
+}
+
+fn compose_project_display_name(compose_target: &str, project_name: Option<&str>) -> String {
+    if let Some(name) = project_name.map(str::trim).filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+
+    let target_path = Path::new(compose_target.trim());
+    if target_path.is_dir() {
+        target_path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| compose_target.to_string())
+    } else {
+        target_path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|value| value.to_string_lossy().to_string())
+            .or_else(|| {
+                target_path
+                    .file_stem()
+                    .map(|value| value.to_string_lossy().to_string())
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| compose_target.to_string())
+    }
+}
+
+fn primary_compose_target(config_files: &str) -> String {
+    config_files
+        .split(',')
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn compose_target_working_dir(target: &str) -> String {
+    let target_path = Path::new(target);
+    if target_path.is_dir() {
+        target.to_string()
+    } else {
+        target_path
+            .parent()
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_default()
+    }
+}
+
+fn parse_json_list<T>(bytes: &[u8]) -> Result<Vec<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    if text.starts_with('[') {
+        serde_json::from_str(&text).context("unable to parse docker json array output")
+    } else {
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .with_context(|| format!("unable to parse docker json row: {line}"))
+            })
+            .collect()
+    }
 }
 
 fn native_pull_entry(image: &str, sender: &Sender<WorkerEvent>) -> Result<StoredImageRecord> {

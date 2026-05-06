@@ -1,6 +1,6 @@
 use eframe::egui::{self, Align, Color32, Layout, RichText};
 
-use super::{ContainerInfo, DockerImageInfo, RuntimeStatusInfo, WorkspaceTab};
+use super::{ContainerInfo, DockerImageInfo, ProjectInfo, RuntimeStatusInfo, WorkspaceTab};
 
 pub(super) fn shorten_container_id(value: &str) -> String {
     value.chars().take(12).collect()
@@ -9,6 +9,7 @@ pub(super) fn shorten_container_id(value: &str) -> String {
 pub(super) fn workspace_title(tab: WorkspaceTab) -> &'static str {
     match tab {
         WorkspaceTab::Home => "Home",
+        WorkspaceTab::Projects => "Projects",
         WorkspaceTab::Containers => "Containers",
         WorkspaceTab::Images => "Images",
         WorkspaceTab::Build => "Build & Run",
@@ -153,6 +154,26 @@ pub(super) fn filtered_containers(
         .collect()
 }
 
+pub(super) fn filtered_projects(projects: &[ProjectInfo], filter: &str) -> Vec<ProjectInfo> {
+    let needle = normalize_filter(filter);
+    projects
+        .iter()
+        .filter(|project| {
+            needle.is_empty()
+                || matches_filter(
+                    &[
+                        &project.name,
+                        &project.status,
+                        &project.config_files,
+                        &project.working_dir,
+                    ],
+                    &needle,
+                )
+        })
+        .cloned()
+        .collect()
+}
+
 pub(super) fn matches_filter(fields: &[&str], needle: &str) -> bool {
     fields
         .iter()
@@ -221,4 +242,13 @@ pub(super) fn state_color(state: &str) -> Color32 {
         "created" => Color32::from_rgb(241, 196, 15),
         _ => Color32::from_rgb(149, 165, 166),
     }
+}
+
+pub(super) fn primary_project_target(config_files: &str) -> String {
+    config_files
+        .split(',')
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
 }

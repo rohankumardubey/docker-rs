@@ -271,6 +271,226 @@ impl DockerDesktopApp {
         });
     }
 
+    fn render_projects_panel(&mut self, ui: &mut egui::Ui) {
+        let max_height = (ui.available_height() - 360.0).max(180.0);
+        ui.horizontal(|ui| {
+            ui.heading("Compose Projects");
+            ui.label(filtered_total_label(
+                filtered_projects(&self.projects, &self.project_filter).len(),
+                self.projects.len(),
+            ));
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Open Compose Project");
+            ui.add_space(8.0);
+            ui.add(
+                TextEdit::singleline(&mut self.compose_target)
+                    .hint_text("/path/to/docker-compose.yml or /path/to/project"),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Choose Compose File").clicked() {
+                    if let Some(path) = FileDialog::new()
+                        .add_filter("Compose", &["yml", "yaml"])
+                        .pick_file()
+                    {
+                        self.compose_target = path.display().to_string();
+                    }
+                }
+                if ui.button("Choose Project Folder").clicked() {
+                    if let Some(path) = FileDialog::new().pick_folder() {
+                        self.compose_target = path.display().to_string();
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.add(
+                TextEdit::singleline(&mut self.compose_project_name)
+                    .hint_text("Optional project name override"),
+            );
+            ui.small("Leave the project name blank to use Docker Compose defaults.");
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(self.running_task.is_none(), egui::Button::new("Up"))
+                    .clicked()
+                {
+                    self.start_compose_up();
+                }
+                if ui
+                    .add_enabled(self.running_task.is_none(), egui::Button::new("Down"))
+                    .clicked()
+                {
+                    self.start_compose_down();
+                }
+                if ui
+                    .add_enabled(self.running_task.is_none(), egui::Button::new("Logs"))
+                    .clicked()
+                {
+                    self.fetch_compose_logs();
+                }
+                if ui.button("Clear").clicked() {
+                    self.compose_target.clear();
+                    self.compose_project_name.clear();
+                    self.selected_project_name = None;
+                }
+            });
+        });
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            ui.add(
+                TextEdit::singleline(&mut self.project_filter)
+                    .hint_text("name, status, config path, or working dir"),
+            );
+            if ui.button("Clear").clicked() {
+                self.project_filter.clear();
+            }
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ScrollArea::vertical()
+                .id_salt("projects_scroll")
+                .max_height(max_height)
+                .show(ui, |ui| {
+                    egui::Grid::new("projects_grid")
+                        .striped(true)
+                        .min_col_width(80.0)
+                        .show(ui, |ui| {
+                            ui.strong("Name");
+                            ui.strong("Status");
+                            ui.strong("Config");
+                            ui.strong("Actions");
+                            ui.end_row();
+
+                            let projects = filtered_projects(&self.projects, &self.project_filter);
+                            for project in projects {
+                                let selected = self.selected_project_name.as_deref()
+                                    == Some(project.name.as_str());
+                                if selected {
+                                    ui.colored_label(
+                                        Color32::from_rgb(52, 152, 219),
+                                        RichText::new(&project.name).strong(),
+                                    );
+                                } else {
+                                    ui.label(&project.name);
+                                }
+                                ui.label(&project.status);
+                                ui.label(compact_path(&project.config_files));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Select").clicked() {
+                                        self.select_project(&project);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.running_task.is_none(),
+                                            egui::Button::new("Up"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.select_project(&project);
+                                        self.start_compose_up();
+                                    }
+                                    ui.menu_button("More", |ui| {
+                                        if ui
+                                            .add_enabled(
+                                                self.running_task.is_none(),
+                                                egui::Button::new("Down"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.select_project(&project);
+                                            self.start_compose_down();
+                                            ui.close_menu();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.running_task.is_none(),
+                                                egui::Button::new("Logs"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.select_project(&project);
+                                            self.fetch_compose_logs();
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    }
+
+    fn render_project_details(&mut self, ui: &mut egui::Ui) {
+        let selected_project = self
+            .selected_project_name
+            .as_ref()
+            .and_then(|name| self.projects.iter().find(|project| &project.name == name))
+            .cloned();
+
+        ui.horizontal(|ui| {
+            ui.heading("Project Details");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Refresh Projects").clicked() {
+                    self.refresh_projects();
+                }
+                if ui
+                    .add_enabled(self.running_task.is_none(), egui::Button::new("Logs"))
+                    .clicked()
+                {
+                    self.fetch_compose_logs();
+                }
+                if ui
+                    .add_enabled(self.running_task.is_none(), egui::Button::new("Down"))
+                    .clicked()
+                {
+                    self.start_compose_down();
+                }
+                if ui
+                    .add_enabled(self.running_task.is_none(), egui::Button::new("Up"))
+                    .clicked()
+                {
+                    self.start_compose_up();
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if let Some(project) = selected_project {
+                egui::Grid::new("project_details_meta")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        detail_row(ui, "Name", &project.name);
+                        detail_row(ui, "Status", &project.status);
+                        detail_row(ui, "Compose", &project.config_files);
+                        detail_row(ui, "Working Dir", &project.working_dir);
+                    });
+            } else if !self.compose_target.trim().is_empty() {
+                egui::Grid::new("project_draft_meta")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        detail_row(ui, "Compose", self.compose_target.trim());
+                        detail_row(
+                            ui,
+                            "Project Name",
+                            &empty_as_dash(self.compose_project_name.trim()),
+                        );
+                    });
+            } else {
+                ui.label("Choose a discovered project or point the form at a compose file or project folder.");
+            }
+        });
+    }
+
     fn render_image_details(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Image Details");
@@ -722,6 +942,12 @@ impl DockerDesktopApp {
         self.render_nav_button(ui, WorkspaceTab::Home, "Home", "Overview and quick actions");
         self.render_nav_button(
             ui,
+            WorkspaceTab::Projects,
+            "Projects",
+            &format!("{} compose", self.projects.len()),
+        );
+        self.render_nav_button(
+            ui,
             WorkspaceTab::Containers,
             "Containers",
             &format!("{} total", self.containers.len()),
@@ -797,6 +1023,7 @@ impl DockerDesktopApp {
                     .count()
                     .to_string(),
             );
+            stat_line(ui, "Projects", &self.projects.len().to_string());
             stat_line(ui, "Images", &self.images.len().to_string());
         });
 
@@ -804,7 +1031,7 @@ impl DockerDesktopApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.strong("Shortcuts");
             ui.add_space(6.0);
-            ui.small("Cmd/Ctrl+1..5 switch pages");
+            ui.small("Cmd/Ctrl+1..6 switch pages");
             ui.small("Esc goes back");
             ui.small("Cmd/Ctrl+R refreshes");
         });
@@ -833,6 +1060,7 @@ impl DockerDesktopApp {
                 self.navigate_back();
             }
             self.render_toolbar_tab(ui, WorkspaceTab::Home, "Home");
+            self.render_toolbar_tab(ui, WorkspaceTab::Projects, "Projects");
             self.render_toolbar_tab(ui, WorkspaceTab::Containers, "Containers");
             self.render_toolbar_tab(ui, WorkspaceTab::Images, "Images");
             self.render_toolbar_tab(ui, WorkspaceTab::Build, "Build & Run");
@@ -959,6 +1187,7 @@ impl DockerDesktopApp {
     pub(super) fn render_workspace(&mut self, ui: &mut egui::Ui) {
         match self.workspace_tab {
             WorkspaceTab::Home => self.render_home_page(ui),
+            WorkspaceTab::Projects => self.render_projects_page(ui),
             WorkspaceTab::Containers => self.render_containers_page(ui),
             WorkspaceTab::Images => self.render_images_page(ui),
             WorkspaceTab::Build => self.render_build_page(ui),
@@ -983,6 +1212,7 @@ impl DockerDesktopApp {
                         .to_string(),
                 );
                 stat_line(ui, "Total containers", &self.containers.len().to_string());
+                stat_line(ui, "Compose projects", &self.projects.len().to_string());
                 stat_line(ui, "Local images", &self.images.len().to_string());
                 stat_line(
                     ui,
@@ -1004,6 +1234,9 @@ impl DockerDesktopApp {
                 );
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
+                    if ui.button("Open Projects").clicked() {
+                        self.navigate_to(WorkspaceTab::Projects);
+                    }
                     if ui.button("Open Containers").clicked() {
                         self.navigate_to(WorkspaceTab::Containers);
                     }
@@ -1076,6 +1309,21 @@ impl DockerDesktopApp {
                         if self.images.is_empty() {
                             ui.label("No images in the native store yet.");
                         }
+                    });
+            });
+        });
+    }
+
+    fn render_projects_page(&mut self, ui: &mut egui::Ui) {
+        ui.columns(2, |columns| {
+            egui::Frame::group(columns[0].style()).show(&mut columns[0], |ui| {
+                self.render_projects_panel(ui);
+            });
+            egui::Frame::group(columns[1].style()).show(&mut columns[1], |ui| {
+                ScrollArea::vertical()
+                    .id_salt("project_details_page")
+                    .show(ui, |ui| {
+                        self.render_project_details(ui);
                     });
             });
         });
