@@ -296,6 +296,7 @@ pub fn run_container(
     ports: Option<String>,
     env_vars: Option<String>,
     volume_mounts: Option<String>,
+    network_name: Option<String>,
     command_override: Option<String>,
     restart_policy: Option<String>,
     auto_remove: bool,
@@ -319,6 +320,10 @@ pub fn run_container(
             let value = value.trim().to_owned();
             if value.is_empty() { None } else { Some(value) }
         });
+        let trimmed_network_name = network_name.and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        });
         let trimmed_command = command_override.and_then(|value| {
             let value = value.trim().to_owned();
             if value.is_empty() { None } else { Some(value) }
@@ -334,6 +339,7 @@ pub fn run_container(
             trimmed_ports.as_deref(),
             trimmed_env_vars.as_deref(),
             trimmed_volume_mounts.as_deref(),
+            trimmed_network_name.as_deref(),
             trimmed_command.as_deref(),
             trimmed_restart_policy.as_deref(),
             auto_remove,
@@ -422,6 +428,51 @@ pub fn remove_image(image: String, sender: Sender<WorkerEvent>) {
                 )
             })
             .map_err(|err| format!("Image delete failed for `{trimmed_image}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn retag_image(source_image: String, target_image: String, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let trimmed_source = source_image.trim().to_owned();
+        let trimmed_target = target_image.trim().to_owned();
+        let result = retag_image_entry(&trimmed_source, &trimmed_target)
+            .map(|record| {
+                format!(
+                    "Tagged native image `{}` as `{}`.",
+                    display_record(&record),
+                    trimmed_target
+                )
+            })
+            .map_err(|err| {
+                format!("Image retag failed from `{trimmed_source}` to `{trimmed_target}`: {err}")
+            });
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn export_image(image: String, output_path: String, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let trimmed_image = image.trim().to_owned();
+        let trimmed_output = output_path.trim().to_owned();
+        let result = export_image_entry(&trimmed_image, &trimmed_output)
+            .map(|path| format!("Exported native image `{trimmed_image}` to `{path}`."))
+            .map_err(|err| format!("Image export failed for `{trimmed_image}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn import_image(archive_path: String, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let trimmed_archive = archive_path.trim().to_owned();
+        let result = import_image_entry(&trimmed_archive)
+            .map(|record| {
+                format!(
+                    "Imported native image `{}` from `{trimmed_archive}`.",
+                    display_record(&record)
+                )
+            })
+            .map_err(|err| format!("Image import failed for `{trimmed_archive}`: {err}"));
         let _ = sender.send(WorkerEvent::ActionFinished(result));
     });
 }

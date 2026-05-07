@@ -64,11 +64,13 @@ pub struct DockerDesktopApp {
     run_ports: String,
     run_env: String,
     run_volumes: String,
+    run_network: String,
     run_command: String,
     run_restart_policy: String,
     run_auto_remove: bool,
     run_ports_auto: bool,
     exec_command_input: String,
+    image_tag_target: String,
     logs: Vec<String>,
     images: Vec<DockerImageInfo>,
     projects: Vec<ProjectInfo>,
@@ -133,11 +135,13 @@ impl DockerDesktopApp {
             run_ports: String::new(),
             run_env: String::new(),
             run_volumes: String::new(),
+            run_network: String::new(),
             run_command: String::new(),
             run_restart_policy: String::new(),
             run_auto_remove: false,
             run_ports_auto: true,
             exec_command_input: String::from("uname -a"),
+            image_tag_target: String::new(),
             logs: vec![String::from("Docker RS Desktop native engine started.")],
             images: Vec::new(),
             projects: Vec::new(),
@@ -244,6 +248,9 @@ impl DockerDesktopApp {
                 },
                 WorkerEvent::ImageDetails(result) => match result {
                     Ok(details) => {
+                        if self.selected_image_ref.as_deref() != Some(details.reference.as_str()) {
+                            self.image_tag_target.clear();
+                        }
                         self.selected_image_ref = Some(details.reference.clone());
                         self.selected_image_details = Some(details);
                     }
@@ -392,6 +399,23 @@ impl DockerDesktopApp {
 
         self.running_task = Some(format!("Pulling {image}"));
         engine::pull_image(image, self.event_sender.clone());
+    }
+
+    fn import_image_action(&mut self, archive_path: String) {
+        let archive_path = archive_path.trim().to_owned();
+        if archive_path.is_empty() {
+            self.show_toast(
+                String::from("Image import aborted: archive path is required."),
+                ToastKind::Error,
+            );
+            self.logs.push(String::from(
+                "Image import aborted: archive path is required.",
+            ));
+            return;
+        }
+
+        self.running_task = Some(format!("Importing image archive {}", archive_path));
+        engine::import_image(archive_path, self.event_sender.clone());
     }
 
     fn start_build(&mut self) {
@@ -817,6 +841,11 @@ impl DockerDesktopApp {
         } else {
             Some(self.run_volumes.trim().to_owned())
         };
+        let network_name = if self.run_network.trim().is_empty() {
+            None
+        } else {
+            Some(self.run_network.trim().to_owned())
+        };
         let command_override = if self.run_command.trim().is_empty() {
             None
         } else {
@@ -846,6 +875,7 @@ impl DockerDesktopApp {
             ports,
             env_vars,
             volume_mounts,
+            network_name,
             command_override,
             restart_policy,
             self.run_auto_remove,
@@ -933,8 +963,43 @@ impl DockerDesktopApp {
         if self.selected_image_ref.as_deref() == Some(image.as_str()) {
             self.selected_image_ref = None;
             self.selected_image_details = None;
+            self.image_tag_target.clear();
         }
         engine::remove_image(image, self.event_sender.clone());
+    }
+
+    fn retag_image_action(&mut self, source_image: String) {
+        let target_image = self.image_tag_target.trim().to_owned();
+        if target_image.is_empty() {
+            self.show_toast(
+                String::from("Image tag aborted: target reference is required."),
+                ToastKind::Error,
+            );
+            self.logs.push(String::from(
+                "Image tag aborted: target reference is required.",
+            ));
+            return;
+        }
+
+        self.running_task = Some(format!("Tagging image {source_image} as {target_image}"));
+        engine::retag_image(source_image, target_image, self.event_sender.clone());
+    }
+
+    fn export_image_action(&mut self, image: String, output_path: String) {
+        let output_path = output_path.trim().to_owned();
+        if output_path.is_empty() {
+            self.show_toast(
+                String::from("Image export aborted: output path is required."),
+                ToastKind::Error,
+            );
+            self.logs.push(String::from(
+                "Image export aborted: output path is required.",
+            ));
+            return;
+        }
+
+        self.running_task = Some(format!("Exporting image {image}"));
+        engine::export_image(image, output_path, self.event_sender.clone());
     }
 
     fn remove_container_action(&mut self, container_id: String) {
@@ -1046,6 +1111,7 @@ impl DockerDesktopApp {
         self.run_ports = default_ports_for_image(image).to_string();
         self.run_env.clear();
         self.run_volumes.clear();
+        self.run_network.clear();
         self.run_command.clear();
         self.run_restart_policy.clear();
         self.run_auto_remove = false;

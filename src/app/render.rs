@@ -104,9 +104,20 @@ impl DockerDesktopApp {
         ui.add(
             TextEdit::multiline(&mut self.run_volumes)
                 .desired_rows(3)
-                .hint_text("/absolute/host/path:/container/path\n./data:/var/lib/app:ro"),
+                .hint_text(
+                    "/absolute/host/path:/container/path\n./data:/var/lib/app:ro\nmy-volume:/var/lib/app",
+                ),
         );
-        ui.small("Use one bind mount per line in `host:container[:ro]` form.");
+        ui.small(
+            "Use one mount per line. Bind mounts use `host:container[:ro]`; native named volumes use `volume-name:container[:ro]`.",
+        );
+        ui.add_space(8.0);
+        ui.label("Network");
+        ui.add(
+            TextEdit::singleline(&mut self.run_network)
+                .hint_text("Optional network, e.g. app-network"),
+        );
+        ui.small("Use a native network name from the Networks page.");
         ui.add_space(8.0);
         ui.label("Command Override");
         ui.add(
@@ -189,6 +200,19 @@ impl DockerDesktopApp {
                 filtered_images(&self.images, &self.image_filter).len(),
                 self.images.len(),
             ));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.running_task.is_none(), egui::Button::new("Import OCI"))
+                    .clicked()
+                {
+                    if let Some(path) = FileDialog::new()
+                        .add_filter("OCI archive", &["tar"])
+                        .pick_file()
+                    {
+                        self.import_image_action(path.display().to_string());
+                    }
+                }
+            });
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -250,6 +274,26 @@ impl DockerDesktopApp {
                                     ui.menu_button("More", |ui| {
                                         if ui.button("Use").clicked() {
                                             self.prefill_run_from_image(image_ref.clone());
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Tag").clicked() {
+                                            self.inspect_image_action(image_ref.clone());
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Export").clicked() {
+                                            if let Some(path) = FileDialog::new()
+                                                .set_file_name(&format!(
+                                                    "{}-{}.tar",
+                                                    image.repository.replace('/', "_"),
+                                                    image.tag
+                                                ))
+                                                .save_file()
+                                            {
+                                                self.export_image_action(
+                                                    image_ref.clone(),
+                                                    path.display().to_string(),
+                                                );
+                                            }
                                             ui.close_menu();
                                         }
                                         if ui
@@ -893,6 +937,20 @@ impl DockerDesktopApp {
                     {
                         self.start_run_from_image(image_ref.clone());
                     }
+                    if ui
+                        .add_enabled(self.running_task.is_none(), egui::Button::new("Export"))
+                        .clicked()
+                    {
+                        if let Some(path) = FileDialog::new()
+                            .set_file_name(&format!(
+                                "{}.tar",
+                                image_ref.replace('/', "_").replace(':', "-")
+                            ))
+                            .save_file()
+                        {
+                            self.export_image_action(image_ref.clone(), path.display().to_string());
+                        }
+                    }
                     if ui.button("Use").clicked() {
                         self.prefill_run_from_image(image_ref.clone());
                     }
@@ -908,14 +966,14 @@ impl DockerDesktopApp {
                 });
             }
         });
-        if let Some(details) = self.selected_image_details.as_ref() {
+        if let Some(details) = self.selected_image_details.clone() {
             ui.add_space(4.0);
             ui.label(RichText::new(&details.reference).monospace().weak());
         }
         ui.add_space(8.0);
 
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            if let Some(details) = self.selected_image_details.as_ref() {
+            if let Some(details) = self.selected_image_details.clone() {
                 egui::Grid::new("image_details_meta")
                     .num_columns(2)
                     .spacing([16.0, 8.0])
@@ -935,6 +993,28 @@ impl DockerDesktopApp {
                         detail_row(ui, "Manifest", &details.manifest_digest);
                         detail_row(ui, "Config", &details.config_digest);
                     });
+
+                ui.add_space(12.0);
+                ui.heading("Tag Image");
+                ui.add_space(6.0);
+                ui.add(
+                    TextEdit::singleline(&mut self.image_tag_target)
+                        .hint_text("my-registry/my-image:new-tag"),
+                );
+                ui.small("Create another native image reference without re-pulling layers.");
+                ui.add_space(8.0);
+                let image_ref = details.reference.clone();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(self.running_task.is_none(), egui::Button::new("Create Tag"))
+                        .clicked()
+                    {
+                        self.retag_image_action(image_ref.clone());
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.image_tag_target.clear();
+                    }
+                });
 
                 ui.add_space(12.0);
                 ui.heading("Environment");
@@ -1208,6 +1288,7 @@ impl DockerDesktopApp {
                         detail_row(ui, "Status", &details.status);
                         detail_row(ui, "Ports", &details.ports);
                         detail_row(ui, "IP Address", &empty_as_dash(&details.ip_address));
+                        detail_row(ui, "Networks", &empty_as_dash(&details.networks));
                         detail_row(ui, "User", &empty_as_dash(&details.user));
                         detail_row(ui, "Working Dir", &empty_as_dash(&details.working_dir));
                         detail_row(ui, "Restart", &details.restart_policy);

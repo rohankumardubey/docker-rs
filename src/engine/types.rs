@@ -95,6 +95,7 @@ pub struct ContainerDetailsInfo {
     pub status: String,
     pub ports: String,
     pub ip_address: String,
+    pub networks: String,
     pub working_dir: String,
     pub user: String,
     pub restart_policy: String,
@@ -235,6 +236,8 @@ pub(super) struct NativeContainerRecord {
     pub(super) ports: Vec<String>,
     pub(super) env: Vec<String>,
     pub(super) volumes: Vec<String>,
+    #[serde(default)]
+    pub(super) networks: Vec<String>,
     pub(super) command: String,
     pub(super) entrypoint: String,
     pub(super) working_dir: String,

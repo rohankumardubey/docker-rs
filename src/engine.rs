@@ -30,12 +30,12 @@ mod types;
 
 pub use self::tasks::{
     build_image, check_engine_status, check_runtime_status, compose_project_down,
-    compose_project_up, create_network, create_volume, exec_in_container, fetch_container_logs,
-    fetch_project_logs, follow_container_logs, inspect_container, inspect_container_stats,
-    inspect_image, inspect_network, inspect_volume, pull_image, refresh_containers, refresh_images,
-    refresh_networks, refresh_projects, refresh_volumes, remove_container, remove_image,
-    remove_network, remove_volume, restart_container, run_container, start_container,
-    start_runtime, stop_container,
+    compose_project_up, create_network, create_volume, exec_in_container, export_image,
+    fetch_container_logs, fetch_project_logs, follow_container_logs, import_image,
+    inspect_container, inspect_container_stats, inspect_image, inspect_network, inspect_volume,
+    pull_image, refresh_containers, refresh_images, refresh_networks, refresh_projects,
+    refresh_volumes, remove_container, remove_image, remove_network, remove_volume,
+    restart_container, retag_image, run_container, start_container, start_runtime, stop_container,
 };
 use self::types::*;
 pub use self::types::{
@@ -513,6 +513,8 @@ fn inspect_container_entry(container_id: &str) -> Result<ContainerDetailsInfo> {
         ip_address: Option<String>,
         #[serde(rename = "Ports")]
         ports: Option<HashMap<String, Option<Vec<DockerPortBinding>>>>,
+        #[serde(rename = "Networks")]
+        networks: Option<HashMap<String, serde_json::Value>>,
     }
 
     #[derive(Deserialize)]
@@ -577,6 +579,17 @@ fn inspect_container_entry(container_id: &str) -> Result<ContainerDetailsInfo> {
         .map(format_inspect_ports)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| String::from("-"));
+    let networks = row
+        .network_settings
+        .as_ref()
+        .and_then(|item| item.networks.as_ref())
+        .map(|items| {
+            let mut names = items.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            names.join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("-"));
 
     Ok(ContainerDetailsInfo {
         id: row.id,
@@ -595,6 +608,7 @@ fn inspect_container_entry(container_id: &str) -> Result<ContainerDetailsInfo> {
             .as_ref()
             .and_then(|item| item.ip_address.clone())
             .unwrap_or_default(),
+        networks,
         working_dir: config
             .as_ref()
             .and_then(|item| item.working_dir.clone())
@@ -685,6 +699,7 @@ fn run_container_entry(
     ports: Option<&str>,
     env_vars: Option<&str>,
     volume_mounts: Option<&str>,
+    network_name: Option<&str>,
     command_override: Option<&str>,
     restart_policy: Option<&str>,
     auto_remove: bool,
@@ -696,13 +711,17 @@ fn run_container_entry(
     if auto_remove && restart_policy.is_some() {
         bail!("auto-remove (`--rm`) cannot be combined with a restart policy");
     }
+    let paths = ensure_engine_paths()?;
+    let resolved_volume_mounts = resolve_volume_mounts(&paths, volume_mounts)?;
+    let resolved_networks = resolve_network_selection(&paths, network_name)?;
 
     let native_result = run_native_container_entry(
         image,
         container_name,
         ports,
         env_vars,
-        volume_mounts,
+        &resolved_volume_mounts,
+        &resolved_networks,
         command_override,
         restart_policy,
         auto_remove,
@@ -743,9 +762,13 @@ fn run_container_entry(
         args.push(env_var);
     }
 
-    for mount in parse_volume_mounts(volume_mounts) {
+    for mount in &resolved_volume_mounts {
         args.push(String::from("-v"));
-        args.push(mount);
+        args.push(mount.clone());
+    }
+    if let Some(network) = resolved_networks.first() {
+        args.push(String::from("--network"));
+        args.push(network.clone());
     }
 
     args.push(image.to_string());
@@ -1273,6 +1296,297 @@ fn remove_image_entry(image: &str) -> Result<StoredImageRecord> {
     Ok(removed)
 }
 
+fn retag_image_entry(source_image: &str, target_image: &str) -> Result<StoredImageRecord> {
+    if source_image.trim().is_empty() {
+        bail!("source image is required");
+    }
+    if target_image.trim().is_empty() {
+        bail!("target image is required");
+    }
+
+    let paths = ensure_engine_paths()?;
+    let mut state = load_state(&paths)?;
+    let source_record = state
+        .images
+        .iter()
+        .find(|record| {
+            record.canonical_reference == source_image
+                || format!("{}:{}", record.repository, record.tag) == source_image
+        })
+        .cloned()
+        .ok_or_else(|| anyhow!("image `{source_image}` was not found in the native store"))?;
+
+    let target_reference: Reference = target_image
+        .parse()
+        .with_context(|| format!("invalid target image reference `{target_image}`"))?;
+    let target_canonical = canonical_reference(&target_reference);
+
+    if state
+        .images
+        .iter()
+        .any(|record| record.canonical_reference == target_canonical)
+    {
+        bail!("image `{target_image}` already exists in the native store");
+    }
+
+    let tagged_record = StoredImageRecord {
+        canonical_reference: target_canonical,
+        repository: target_reference.repository().to_string(),
+        tag: target_reference.tag().unwrap_or("latest").to_string(),
+        manifest_digest: source_record.manifest_digest.clone(),
+        config_digest: source_record.config_digest.clone(),
+        size_bytes: source_record.size_bytes,
+        source: String::from("tagged-native"),
+        architecture: source_record.architecture.clone(),
+        os: source_record.os.clone(),
+        created_at_epoch: now_epoch(),
+    };
+
+    state.images.push(tagged_record.clone());
+    state.images.sort_by(|left, right| {
+        left.repository
+            .cmp(&right.repository)
+            .then(left.tag.cmp(&right.tag))
+    });
+    save_state(&paths, &state)?;
+    Ok(tagged_record)
+}
+
+fn export_image_entry(image: &str, output_path: &str) -> Result<String> {
+    if image.trim().is_empty() {
+        bail!("image is required");
+    }
+    if output_path.trim().is_empty() {
+        bail!("output path is required");
+    }
+
+    let paths = ensure_engine_paths()?;
+    let state = load_state(&paths)?;
+    let record = state
+        .images
+        .iter()
+        .find(|record| {
+            record.canonical_reference == image
+                || format!("{}:{}", record.repository, record.tag) == image
+        })
+        .cloned()
+        .ok_or_else(|| anyhow!("image `{image}` was not found in the native store"))?;
+
+    let manifest = load_manifest(&paths, &record.manifest_digest)?;
+    let manifest_path = digest_json_path(&paths.manifests, &record.manifest_digest)?;
+    let manifest_size = fs::metadata(&manifest_path)
+        .with_context(|| format!("unable to read {}", manifest_path.display()))?
+        .len();
+    let tempdir = TempDir::new().context("unable to create temporary OCI export directory")?;
+    let layout_root = tempdir.path();
+    let blobs_root = layout_root.join("blobs");
+
+    fs::create_dir_all(&blobs_root)
+        .with_context(|| format!("unable to create {}", blobs_root.display()))?;
+    fs::write(
+        layout_root.join("oci-layout"),
+        r#"{"imageLayoutVersion":"1.0.0"}"#,
+    )
+    .with_context(|| {
+        format!(
+            "unable to write {}",
+            layout_root.join("oci-layout").display()
+        )
+    })?;
+
+    copy_digest_file(&paths.manifests, &blobs_root, &record.manifest_digest, true)?;
+    copy_digest_file(&paths.configs, &blobs_root, &record.config_digest, true)?;
+    for layer in manifest.layers() {
+        let layer_digest = layer.digest().to_string();
+        copy_digest_file(&paths.blobs, &blobs_root, &layer_digest, false)?;
+    }
+
+    let index_json = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": manifest.media_type().as_ref().map(|media| media.to_string()).unwrap_or_else(|| String::from("application/vnd.oci.image.manifest.v1+json")),
+            "digest": record.manifest_digest,
+            "size": manifest_size,
+            "annotations": {
+                "org.opencontainers.image.ref.name": display_record(&record)
+            }
+        }]
+    });
+
+    fs::write(
+        layout_root.join("index.json"),
+        serde_json::to_vec_pretty(&index_json).context("unable to encode OCI index")?,
+    )
+    .with_context(|| {
+        format!(
+            "unable to write {}",
+            layout_root.join("index.json").display()
+        )
+    })?;
+
+    let output = PathBuf::from(output_path);
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+    }
+
+    let tar_output = Command::new("tar")
+        .arg("-C")
+        .arg(layout_root)
+        .arg("-cf")
+        .arg(&output)
+        .arg(".")
+        .output()
+        .context("unable to launch tar for OCI export")?;
+    if !tar_output.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_output.stderr)
+            .trim()
+            .to_owned();
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                String::from("tar archive creation failed")
+            } else {
+                stderr
+            }
+        );
+    }
+
+    Ok(output.display().to_string())
+}
+
+fn import_image_entry(archive_path: &str) -> Result<StoredImageRecord> {
+    if archive_path.trim().is_empty() {
+        bail!("archive path is required");
+    }
+
+    let archive = PathBuf::from(archive_path);
+    if !archive.is_file() {
+        bail!("archive `{archive_path}` does not exist");
+    }
+
+    let paths = ensure_engine_paths()?;
+    let tempdir = TempDir::new().context("unable to create temporary OCI import directory")?;
+    let unpack_root = tempdir.path();
+
+    let tar_output = Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(unpack_root)
+        .output()
+        .context("unable to launch tar for OCI import")?;
+    if !tar_output.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_output.stderr)
+            .trim()
+            .to_owned();
+        bail!(
+            "{}",
+            if stderr.is_empty() {
+                String::from("tar archive extraction failed")
+            } else {
+                stderr
+            }
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct OciIndexManifest {
+        #[serde(rename = "mediaType")]
+        media_type: Option<String>,
+        digest: String,
+        annotations: Option<HashMap<String, String>>,
+    }
+
+    #[derive(Deserialize)]
+    struct OciIndexDocument {
+        manifests: Vec<OciIndexManifest>,
+    }
+
+    let index_path = unpack_root.join("index.json");
+    let index_text = fs::read_to_string(&index_path)
+        .with_context(|| format!("unable to read {}", index_path.display()))?;
+    let index: OciIndexDocument =
+        serde_json::from_str(&index_text).context("invalid OCI index.json")?;
+    let manifest_entry = index
+        .manifests
+        .into_iter()
+        .find(|entry| {
+            entry
+                .media_type
+                .as_deref()
+                .map(|media| media.contains("image.manifest"))
+                .unwrap_or(true)
+        })
+        .ok_or_else(|| anyhow!("OCI archive did not contain an image manifest"))?;
+
+    let manifest_digest = manifest_entry.digest.clone();
+    let manifest_path = digest_json_path(&unpack_root.join("blobs"), &manifest_digest)?;
+    let manifest = ImageManifest::from_file(&manifest_path)
+        .with_context(|| format!("unable to load {}", manifest_path.display()))?;
+    let config_digest = manifest.config().digest().to_string();
+    let config_path = digest_json_path(&unpack_root.join("blobs"), &config_digest)?;
+    let image_config = ImageConfiguration::from_file(&config_path)
+        .with_context(|| format!("unable to load {}", config_path.display()))?;
+
+    let archive_reference = manifest_entry
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("org.opencontainers.image.ref.name"))
+        .cloned()
+        .unwrap_or_else(|| default_import_reference(&archive));
+    let parsed_reference: Reference = archive_reference
+        .parse()
+        .with_context(|| format!("invalid imported image reference `{archive_reference}`"))?;
+
+    copy_digest_file(
+        &unpack_root.join("blobs"),
+        &paths.manifests,
+        &manifest_digest,
+        true,
+    )?;
+    copy_digest_file(
+        &unpack_root.join("blobs"),
+        &paths.configs,
+        &config_digest,
+        true,
+    )?;
+    for layer in manifest.layers() {
+        let layer_digest = layer.digest().to_string();
+        copy_digest_file(
+            &unpack_root.join("blobs"),
+            &paths.blobs,
+            &layer_digest,
+            false,
+        )?;
+    }
+
+    let size_bytes = manifest
+        .layers()
+        .iter()
+        .map(|layer| layer.size().max(0) as u64)
+        .sum::<u64>()
+        + fs::metadata(&config_path)
+            .with_context(|| format!("unable to read {}", config_path.display()))?
+            .len();
+
+    let record = StoredImageRecord {
+        canonical_reference: canonical_reference(&parsed_reference),
+        repository: parsed_reference.repository().to_string(),
+        tag: parsed_reference.tag().unwrap_or("latest").to_string(),
+        manifest_digest,
+        config_digest,
+        size_bytes,
+        source: String::from("imported-native"),
+        architecture: format!("{:?}", image_config.architecture()),
+        os: format!("{:?}", image_config.os()),
+        created_at_epoch: now_epoch(),
+    };
+
+    upsert_record(&paths, record.clone())?;
+    Ok(record)
+}
+
 fn garbage_collect_store(
     paths: &EnginePaths,
     state: &EngineState,
@@ -1432,7 +1746,8 @@ fn run_native_container_entry(
     container_name: Option<&str>,
     ports: Option<&str>,
     env_vars: Option<&str>,
-    volume_mounts: Option<&str>,
+    volume_mounts: &[String],
+    network_names: &[String],
     command_override: Option<&str>,
     restart_policy: Option<&str>,
     auto_remove: bool,
@@ -1447,9 +1762,15 @@ fn run_native_container_entry(
             "Native runtime prototype does not virtualize ports yet; published ports are informational and rely on the process binding the host port itself.",
         )));
     }
-    if volume_mounts.is_some() {
+    if !volume_mounts.is_empty() {
         let _ = sender.send(WorkerEvent::LogLine(String::from(
-            "Native runtime prototype records volume mounts for now but does not isolate or remap them yet.",
+            "Native runtime prototype records resolved volume mounts for now but does not isolate them yet.",
+        )));
+    }
+    if !network_names.is_empty() {
+        let _ = sender.send(WorkerEvent::LogLine(format!(
+            "Native runtime prototype records network membership for now: {}.",
+            network_names.join(", ")
         )));
     }
 
@@ -1488,7 +1809,8 @@ fn run_native_container_entry(
         status: String::from("Created (native)"),
         ports: parse_port_mappings(ports),
         env,
-        volumes: parse_volume_mounts(volume_mounts),
+        volumes: volume_mounts.to_vec(),
+        networks: network_names.to_vec(),
         command,
         entrypoint: image_spec.entrypoint,
         working_dir: image_spec.working_dir,
@@ -1626,6 +1948,11 @@ fn inspect_native_container_entry(container_id: &str) -> Result<ContainerDetails
         status: record.status,
         ports: render_native_ports(&record.ports),
         ip_address: String::from("host"),
+        networks: if record.networks.is_empty() {
+            String::from("-")
+        } else {
+            record.networks.join(", ")
+        },
         working_dir: record.working_dir,
         user: record.user,
         restart_policy: record.restart_policy,
@@ -2115,6 +2442,77 @@ fn parse_volume_mounts(value: Option<&str>) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn resolve_volume_mounts(paths: &EnginePaths, value: Option<&str>) -> Result<Vec<String>> {
+    let mounts = parse_volume_mounts(value);
+    if mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let volume_state = load_volume_state(paths)?;
+    let mut resolved = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        resolved.push(resolve_volume_mount(paths, &volume_state, &mount)?);
+    }
+    Ok(resolved)
+}
+
+fn resolve_network_selection(paths: &EnginePaths, value: Option<&str>) -> Result<Vec<String>> {
+    let Some(network_name) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+
+    let state = load_network_state(paths)?;
+    let network = state
+        .networks
+        .iter()
+        .find(|network| network.name == network_name)
+        .ok_or_else(|| anyhow!("native network `{network_name}` was not found"))?;
+    Ok(vec![network.name.clone()])
+}
+
+fn resolve_volume_mount(
+    paths: &EnginePaths,
+    state: &NativeVolumeState,
+    mount: &str,
+) -> Result<String> {
+    let parts = mount.split(':').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        bail!("invalid volume mount `{mount}`; expected `source:target[:ro]`");
+    }
+
+    let source = parts[0].trim();
+    let target = parts[1..].join(":");
+    if source.is_empty() {
+        bail!("invalid volume mount `{mount}`; source is required");
+    }
+
+    if looks_like_named_volume(source) {
+        let volume = state
+            .volumes
+            .iter()
+            .find(|volume| volume.name == source)
+            .ok_or_else(|| anyhow!("native volume `{source}` was not found"))?;
+        let mountpoint = if volume.mountpoint.trim().is_empty() || volume.mountpoint == "-" {
+            native_volume_mountpoint(paths, source)
+                .display()
+                .to_string()
+        } else {
+            volume.mountpoint.clone()
+        };
+        Ok(format!("{mountpoint}:{target}"))
+    } else {
+        Ok(mount.to_string())
+    }
+}
+
+fn looks_like_named_volume(source: &str) -> bool {
+    !source.starts_with('/')
+        && !source.starts_with("./")
+        && !source.starts_with("../")
+        && !source.contains('/')
+        && !source.contains('\\')
 }
 
 fn render_command(program: &str, args: &[String]) -> String {
@@ -2951,6 +3349,37 @@ fn write_digest_text(base: &Path, digest: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn copy_digest_file(
+    source_base: &Path,
+    target_base: &Path,
+    digest: &str,
+    is_json: bool,
+) -> Result<()> {
+    let source = if is_json {
+        digest_json_path(source_base, digest)?
+    } else {
+        digest_blob_path(source_base, digest)?
+    };
+    let target = if is_json {
+        digest_json_path(target_base, digest)?
+    } else {
+        digest_blob_path(target_base, digest)?
+    };
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+    }
+    fs::copy(&source, &target).with_context(|| {
+        format!(
+            "unable to copy digest {} from {} to {}",
+            digest,
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn digest_json_path(base: &Path, digest: &str) -> Result<PathBuf> {
     let (algo, hex) = split_digest(digest)?;
     Ok(base.join(algo).join(format!("{hex}.json")))
@@ -2969,6 +3398,33 @@ fn split_digest(digest: &str) -> Result<(&str, &str)> {
 
 fn canonical_reference(reference: &Reference) -> String {
     reference.to_string()
+}
+
+fn default_import_reference(archive: &Path) -> String {
+    let stem = archive
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| String::from("archive"));
+    let sanitized = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    format!(
+        "imported/{}:latest",
+        if sanitized.is_empty() {
+            "archive"
+        } else {
+            sanitized.as_str()
+        }
+    )
 }
 
 fn display_record(record: &StoredImageRecord) -> String {
