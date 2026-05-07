@@ -14,13 +14,16 @@ use eframe::egui;
 use self::helpers::*;
 use crate::engine::{
     self, ContainerDetailsInfo, ContainerInfo, ContainerStatsInfo, DockerImageInfo,
-    EngineStatusInfo, ImageDetailsInfo, ProjectInfo, RuntimeStatusInfo, WorkerEvent,
+    EngineStatusInfo, ImageDetailsInfo, NetworkDetailsInfo, NetworkInfo, ProjectInfo,
+    RuntimeStatusInfo, VolumeDetailsInfo, VolumeInfo, WorkerEvent,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceTab {
     Home,
     Projects,
+    Volumes,
+    Networks,
     Containers,
     Images,
     Build,
@@ -69,17 +72,30 @@ pub struct DockerDesktopApp {
     logs: Vec<String>,
     images: Vec<DockerImageInfo>,
     projects: Vec<ProjectInfo>,
+    volumes: Vec<VolumeInfo>,
+    networks: Vec<NetworkInfo>,
     containers: Vec<ContainerInfo>,
     image_filter: String,
     project_filter: String,
+    volume_filter: String,
+    network_filter: String,
     container_filter: String,
     compose_target: String,
     compose_project_name: String,
+    volume_name_input: String,
+    volume_driver_input: String,
+    network_name_input: String,
+    network_driver_input: String,
+    network_subnet_input: String,
     live_log_stream_container: Option<String>,
     live_log_stop: Option<Arc<AtomicBool>>,
     selected_project_name: Option<String>,
+    selected_volume_name: Option<String>,
+    selected_network_name: Option<String>,
     selected_image_ref: Option<String>,
     selected_image_details: Option<ImageDetailsInfo>,
+    selected_volume_details: Option<VolumeDetailsInfo>,
+    selected_network_details: Option<NetworkDetailsInfo>,
     selected_container_id: Option<String>,
     selected_container_details: Option<ContainerDetailsInfo>,
     selected_container_stats: Option<ContainerStatsInfo>,
@@ -125,17 +141,30 @@ impl DockerDesktopApp {
             logs: vec![String::from("Docker RS Desktop native engine started.")],
             images: Vec::new(),
             projects: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
             containers: Vec::new(),
             image_filter: String::new(),
             project_filter: String::new(),
+            volume_filter: String::new(),
+            network_filter: String::new(),
             container_filter: String::new(),
             compose_target: String::new(),
             compose_project_name: String::new(),
+            volume_name_input: String::new(),
+            volume_driver_input: String::from("local"),
+            network_name_input: String::new(),
+            network_driver_input: String::from("bridge"),
+            network_subnet_input: String::from("172.30.0.0/24"),
             live_log_stream_container: None,
             live_log_stop: None,
             selected_project_name: None,
+            selected_volume_name: None,
+            selected_network_name: None,
             selected_image_ref: None,
             selected_image_details: None,
+            selected_volume_details: None,
+            selected_network_details: None,
             selected_container_id: None,
             selected_container_details: None,
             selected_container_stats: None,
@@ -145,6 +174,8 @@ impl DockerDesktopApp {
         engine::check_runtime_status(event_sender.clone());
         engine::refresh_images(event_sender);
         engine::refresh_projects(app.event_sender.clone());
+        engine::refresh_volumes(app.event_sender.clone());
+        engine::refresh_networks(app.event_sender.clone());
         engine::refresh_containers(app.event_sender.clone());
 
         app
@@ -197,6 +228,20 @@ impl DockerDesktopApp {
                         self.logs.push(format!("Project refresh failed: {message}"));
                     }
                 },
+                WorkerEvent::VolumeList(result) => match result {
+                    Ok(volumes) => {
+                        if let Some(selected_name) = self.selected_volume_name.as_ref() {
+                            if !volumes.iter().any(|volume| &volume.name == selected_name) {
+                                self.selected_volume_name = None;
+                                self.selected_volume_details = None;
+                            }
+                        }
+                        self.volumes = volumes;
+                    }
+                    Err(message) => {
+                        self.logs.push(format!("Volume refresh failed: {message}"));
+                    }
+                },
                 WorkerEvent::ImageDetails(result) => match result {
                     Ok(details) => {
                         self.selected_image_ref = Some(details.reference.clone());
@@ -204,6 +249,41 @@ impl DockerDesktopApp {
                     }
                     Err(message) => {
                         self.logs.push(format!("Image inspect failed: {message}"));
+                    }
+                },
+                WorkerEvent::VolumeDetails(result) => match result {
+                    Ok(details) => {
+                        self.selected_volume_name = Some(details.name.clone());
+                        self.selected_volume_details = Some(details);
+                    }
+                    Err(message) => {
+                        self.logs.push(format!("Volume inspect failed: {message}"));
+                    }
+                },
+                WorkerEvent::NetworkList(result) => match result {
+                    Ok(networks) => {
+                        if let Some(selected_name) = self.selected_network_name.as_ref() {
+                            if !networks
+                                .iter()
+                                .any(|network| &network.name == selected_name)
+                            {
+                                self.selected_network_name = None;
+                                self.selected_network_details = None;
+                            }
+                        }
+                        self.networks = networks;
+                    }
+                    Err(message) => {
+                        self.logs.push(format!("Network refresh failed: {message}"));
+                    }
+                },
+                WorkerEvent::NetworkDetails(result) => match result {
+                    Ok(details) => {
+                        self.selected_network_name = Some(details.name.clone());
+                        self.selected_network_details = Some(details);
+                    }
+                    Err(message) => {
+                        self.logs.push(format!("Network inspect failed: {message}"));
                     }
                 },
                 WorkerEvent::RuntimeStatus(result) => match result {
@@ -267,9 +347,13 @@ impl DockerDesktopApp {
                             self.logs.push(message);
                             engine::refresh_images(self.event_sender.clone());
                             engine::refresh_projects(self.event_sender.clone());
+                            engine::refresh_volumes(self.event_sender.clone());
+                            engine::refresh_networks(self.event_sender.clone());
                             engine::refresh_containers(self.event_sender.clone());
                             engine::check_runtime_status(self.event_sender.clone());
                             self.refresh_selected_image_details();
+                            self.refresh_selected_volume_details();
+                            self.refresh_selected_network_details();
                             self.refresh_selected_container_details();
                             self.refresh_selected_container_stats();
                         }
@@ -278,9 +362,13 @@ impl DockerDesktopApp {
                             self.logs.push(message);
                             engine::refresh_images(self.event_sender.clone());
                             engine::refresh_projects(self.event_sender.clone());
+                            engine::refresh_volumes(self.event_sender.clone());
+                            engine::refresh_networks(self.event_sender.clone());
                             engine::refresh_containers(self.event_sender.clone());
                             engine::check_runtime_status(self.event_sender.clone());
                             self.refresh_selected_image_details();
+                            self.refresh_selected_volume_details();
+                            self.refresh_selected_network_details();
                             self.refresh_selected_container_details();
                             self.refresh_selected_container_stats();
                         }
@@ -350,6 +438,14 @@ impl DockerDesktopApp {
         engine::refresh_projects(self.event_sender.clone());
     }
 
+    fn refresh_volumes(&mut self) {
+        engine::refresh_volumes(self.event_sender.clone());
+    }
+
+    fn refresh_networks(&mut self) {
+        engine::refresh_networks(self.event_sender.clone());
+    }
+
     fn refresh_engine(&mut self) {
         self.logs
             .push(String::from("Refreshing native OCI engine state..."));
@@ -387,18 +483,23 @@ impl DockerDesktopApp {
                 self.refresh_engine();
                 self.refresh_images();
                 self.refresh_projects();
+                self.refresh_networks();
                 self.refresh_runtime();
             }
             WorkspaceTab::Projects => {
                 self.refresh_projects();
                 self.refresh_runtime();
             }
+            WorkspaceTab::Volumes => self.refresh_volumes(),
+            WorkspaceTab::Networks => self.refresh_networks(),
             WorkspaceTab::Containers => self.refresh_runtime(),
             WorkspaceTab::Images => self.refresh_images(),
             WorkspaceTab::Build => {
                 self.refresh_engine();
                 self.refresh_images();
                 self.refresh_projects();
+                self.refresh_volumes();
+                self.refresh_networks();
                 self.refresh_runtime();
             }
             WorkspaceTab::Logs => self.refresh_runtime(),
@@ -412,6 +513,8 @@ impl DockerDesktopApp {
 
         let mut go_home = false;
         let mut go_projects = false;
+        let mut go_volumes = false;
+        let mut go_networks = false;
         let mut go_containers = false;
         let mut go_images = false;
         let mut go_build = false;
@@ -428,15 +531,21 @@ impl DockerDesktopApp {
                 go_projects = true;
             }
             if command && input.key_pressed(egui::Key::Num3) {
-                go_containers = true;
+                go_volumes = true;
             }
             if command && input.key_pressed(egui::Key::Num4) {
-                go_images = true;
+                go_networks = true;
             }
             if command && input.key_pressed(egui::Key::Num5) {
-                go_build = true;
+                go_containers = true;
             }
             if command && input.key_pressed(egui::Key::Num6) {
+                go_images = true;
+            }
+            if command && input.key_pressed(egui::Key::Num7) {
+                go_build = true;
+            }
+            if command && input.key_pressed(egui::Key::Num8) {
                 go_logs = true;
             }
             if input.key_pressed(egui::Key::Escape) {
@@ -455,6 +564,12 @@ impl DockerDesktopApp {
         }
         if go_projects {
             self.navigate_to(WorkspaceTab::Projects);
+        }
+        if go_volumes {
+            self.navigate_to(WorkspaceTab::Volumes);
+        }
+        if go_networks {
+            self.navigate_to(WorkspaceTab::Networks);
         }
         if go_containers {
             self.navigate_to(WorkspaceTab::Containers);
@@ -569,6 +684,104 @@ impl DockerDesktopApp {
             project_name.clone().unwrap_or_else(|| target.clone())
         ));
         engine::fetch_project_logs(target, project_name, self.event_sender.clone());
+    }
+
+    fn inspect_volume_action(&mut self, volume_name: String) {
+        self.navigate_to(WorkspaceTab::Volumes);
+        self.running_task = Some(format!("Inspecting volume {volume_name}"));
+        engine::inspect_volume(volume_name, self.event_sender.clone());
+    }
+
+    fn refresh_selected_volume_details(&mut self) {
+        if let Some(volume_name) = self.selected_volume_name.clone() {
+            engine::inspect_volume(volume_name, self.event_sender.clone());
+        }
+    }
+
+    fn inspect_network_action(&mut self, network_name: String) {
+        self.navigate_to(WorkspaceTab::Networks);
+        self.running_task = Some(format!("Inspecting network {network_name}"));
+        engine::inspect_network(network_name, self.event_sender.clone());
+    }
+
+    fn refresh_selected_network_details(&mut self) {
+        if let Some(network_name) = self.selected_network_name.clone() {
+            engine::inspect_network(network_name, self.event_sender.clone());
+        }
+    }
+
+    fn create_volume_action(&mut self) {
+        let volume_name = self.volume_name_input.trim().to_owned();
+        if volume_name.is_empty() {
+            self.show_toast(
+                String::from("Volume create aborted: name is required."),
+                ToastKind::Error,
+            );
+            self.logs
+                .push(String::from("Volume create aborted: name is required."));
+            return;
+        }
+
+        self.running_task = Some(format!("Creating volume {volume_name}"));
+        let driver = self.volume_driver_input.trim().to_owned();
+        engine::create_volume(
+            volume_name,
+            if driver.is_empty() {
+                None
+            } else {
+                Some(driver)
+            },
+            self.event_sender.clone(),
+        );
+    }
+
+    fn remove_volume_action(&mut self, volume_name: String) {
+        self.running_task = Some(format!("Removing volume {volume_name}"));
+        if self.selected_volume_name.as_deref() == Some(volume_name.as_str()) {
+            self.selected_volume_name = None;
+            self.selected_volume_details = None;
+        }
+        engine::remove_volume(volume_name, self.event_sender.clone());
+    }
+
+    fn create_network_action(&mut self) {
+        let network_name = self.network_name_input.trim().to_owned();
+        if network_name.is_empty() {
+            self.show_toast(
+                String::from("Network create aborted: name is required."),
+                ToastKind::Error,
+            );
+            self.logs
+                .push(String::from("Network create aborted: name is required."));
+            return;
+        }
+
+        self.running_task = Some(format!("Creating network {network_name}"));
+        let driver = self.network_driver_input.trim().to_owned();
+        let subnet = self.network_subnet_input.trim().to_owned();
+        engine::create_network(
+            network_name,
+            if driver.is_empty() {
+                None
+            } else {
+                Some(driver)
+            },
+            if subnet.is_empty() {
+                None
+            } else {
+                Some(subnet)
+            },
+            self.event_sender.clone(),
+        );
+    }
+
+    fn remove_network_action(&mut self, network_name: String) {
+        self.running_task = Some(format!("Removing network {network_name}"));
+        if self.selected_network_name.as_deref() == Some(network_name.as_str()) {
+            self.selected_network_name = None;
+            self.selected_network_details = None;
+        }
+        engine::remove_network(network_name, self.event_sender.clone());
     }
 
     fn start_run(&mut self) {

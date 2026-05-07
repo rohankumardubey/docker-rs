@@ -1,6 +1,9 @@
 use eframe::egui::{self, Align, Color32, Layout, RichText};
 
-use super::{ContainerInfo, DockerImageInfo, ProjectInfo, RuntimeStatusInfo, WorkspaceTab};
+use super::{
+    ContainerInfo, DockerImageInfo, NetworkInfo, ProjectInfo, RuntimeStatusInfo, VolumeInfo,
+    WorkspaceTab,
+};
 
 pub(super) fn shorten_container_id(value: &str) -> String {
     value.chars().take(12).collect()
@@ -10,6 +13,8 @@ pub(super) fn workspace_title(tab: WorkspaceTab) -> &'static str {
     match tab {
         WorkspaceTab::Home => "Home",
         WorkspaceTab::Projects => "Projects",
+        WorkspaceTab::Volumes => "Volumes",
+        WorkspaceTab::Networks => "Networks",
         WorkspaceTab::Containers => "Containers",
         WorkspaceTab::Images => "Images",
         WorkspaceTab::Build => "Build & Run",
@@ -166,6 +171,47 @@ pub(super) fn filtered_projects(projects: &[ProjectInfo], filter: &str) -> Vec<P
                         &project.status,
                         &project.config_files,
                         &project.working_dir,
+                    ],
+                    &needle,
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+pub(super) fn filtered_volumes(volumes: &[VolumeInfo], filter: &str) -> Vec<VolumeInfo> {
+    let needle = normalize_filter(filter);
+    volumes
+        .iter()
+        .filter(|volume| {
+            needle.is_empty()
+                || matches_filter(
+                    &[
+                        &volume.name,
+                        &volume.driver,
+                        &volume.mountpoint,
+                        &volume.scope,
+                    ],
+                    &needle,
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+pub(super) fn filtered_networks(networks: &[NetworkInfo], filter: &str) -> Vec<NetworkInfo> {
+    let needle = normalize_filter(filter);
+    networks
+        .iter()
+        .filter(|network| {
+            needle.is_empty()
+                || matches_filter(
+                    &[
+                        &network.name,
+                        &network.driver,
+                        &network.subnet,
+                        &network.gateway,
+                        &network.scope,
                     ],
                     &needle,
                 )

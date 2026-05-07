@@ -46,6 +46,45 @@ pub struct ProjectInfo {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct VolumeInfo {
+    pub name: String,
+    pub driver: String,
+    pub mountpoint: String,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VolumeDetailsInfo {
+    pub name: String,
+    pub driver: String,
+    pub mountpoint: String,
+    pub scope: String,
+    pub created_at: String,
+    pub labels: Vec<(String, String)>,
+    pub options: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NetworkInfo {
+    pub name: String,
+    pub driver: String,
+    pub subnet: String,
+    pub gateway: String,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NetworkDetailsInfo {
+    pub name: String,
+    pub driver: String,
+    pub subnet: String,
+    pub gateway: String,
+    pub scope: String,
+    pub created_at: String,
+    pub labels: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct ContainerDetailsInfo {
     pub id: String,
     pub name: String,
@@ -102,6 +141,10 @@ pub enum WorkerEvent {
     RuntimeStatus(Result<RuntimeStatusInfo, String>),
     ImageList(Result<Vec<DockerImageInfo>, String>),
     ProjectList(Result<Vec<ProjectInfo>, String>),
+    VolumeList(Result<Vec<VolumeInfo>, String>),
+    VolumeDetails(Result<VolumeDetailsInfo, String>),
+    NetworkList(Result<Vec<NetworkInfo>, String>),
+    NetworkDetails(Result<NetworkDetailsInfo, String>),
     ImageDetails(Result<ImageDetailsInfo, String>),
     ContainerList(Result<Vec<ContainerInfo>, String>),
     ContainerDetails(Result<ContainerDetailsInfo, String>),
@@ -117,6 +160,10 @@ pub(super) struct EnginePaths {
     pub(super) manifests: PathBuf,
     pub(super) configs: PathBuf,
     pub(super) metadata: PathBuf,
+    pub(super) volume_root: PathBuf,
+    pub(super) volume_metadata: PathBuf,
+    pub(super) network_root: PathBuf,
+    pub(super) network_metadata: PathBuf,
     pub(super) runtime_metadata: PathBuf,
     pub(super) runtime_logs: PathBuf,
     pub(super) runtime_meta: PathBuf,
@@ -144,6 +191,38 @@ pub(super) struct StoredImageRecord {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(super) struct NativeRuntimeState {
     pub(super) containers: Vec<NativeContainerRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(super) struct NativeVolumeState {
+    pub(super) volumes: Vec<NativeVolumeRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct NativeVolumeRecord {
+    pub(super) name: String,
+    pub(super) driver: String,
+    pub(super) mountpoint: String,
+    pub(super) scope: String,
+    pub(super) created_at: String,
+    pub(super) labels: Vec<(String, String)>,
+    pub(super) options: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(super) struct NativeNetworkState {
+    pub(super) networks: Vec<NativeNetworkRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct NativeNetworkRecord {
+    pub(super) name: String,
+    pub(super) driver: String,
+    pub(super) subnet: String,
+    pub(super) gateway: String,
+    pub(super) scope: String,
+    pub(super) created_at: String,
+    pub(super) labels: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -28,10 +28,38 @@ pub fn refresh_projects(sender: Sender<WorkerEvent>) {
     });
 }
 
+pub fn refresh_volumes(sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let result = list_volumes().map_err(|err| err.to_string());
+        let _ = sender.send(WorkerEvent::VolumeList(result));
+    });
+}
+
+pub fn refresh_networks(sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let result = list_networks().map_err(|err| err.to_string());
+        let _ = sender.send(WorkerEvent::NetworkList(result));
+    });
+}
+
 pub fn inspect_image(image: String, sender: Sender<WorkerEvent>) {
     thread::spawn(move || {
         let result = inspect_image_entry(&image).map_err(|err| err.to_string());
         let _ = sender.send(WorkerEvent::ImageDetails(result));
+    });
+}
+
+pub fn inspect_volume(volume_name: String, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let result = inspect_volume_entry(&volume_name).map_err(|err| err.to_string());
+        let _ = sender.send(WorkerEvent::VolumeDetails(result));
+    });
+}
+
+pub fn inspect_network(network_name: String, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let result = inspect_network_entry(&network_name).map_err(|err| err.to_string());
+        let _ = sender.send(WorkerEvent::NetworkDetails(result));
     });
 }
 
@@ -196,6 +224,68 @@ pub fn fetch_project_logs(
             fetch_project_logs_entry(&trimmed_target, trimmed_project_name.as_deref(), &sender)
                 .map(|name| format!("Fetched logs for compose project `{name}`."))
                 .map_err(|err| format!("Compose logs failed for `{trimmed_target}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn create_volume(volume_name: String, driver: Option<String>, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let trimmed_name = volume_name.trim().to_owned();
+        let trimmed_driver = driver.and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        });
+        let result = create_volume_entry(&trimmed_name, trimmed_driver.as_deref(), &sender)
+            .map(|name| format!("Created volume `{name}`."))
+            .map_err(|err| format!("Volume create failed for `{trimmed_name}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn remove_volume(volume_name: String, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let trimmed_name = volume_name.trim().to_owned();
+        let result = remove_volume_entry(&trimmed_name, &sender)
+            .map(|name| format!("Removed volume `{name}`."))
+            .map_err(|err| format!("Volume delete failed for `{trimmed_name}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn create_network(
+    network_name: String,
+    driver: Option<String>,
+    subnet: Option<String>,
+    sender: Sender<WorkerEvent>,
+) {
+    thread::spawn(move || {
+        let trimmed_name = network_name.trim().to_owned();
+        let trimmed_driver = driver.and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        });
+        let trimmed_subnet = subnet.and_then(|value| {
+            let value = value.trim().to_owned();
+            if value.is_empty() { None } else { Some(value) }
+        });
+        let result = create_network_entry(
+            &trimmed_name,
+            trimmed_driver.as_deref(),
+            trimmed_subnet.as_deref(),
+            &sender,
+        )
+        .map(|name| format!("Created network `{name}`."))
+        .map_err(|err| format!("Network create failed for `{trimmed_name}`: {err}"));
+        let _ = sender.send(WorkerEvent::ActionFinished(result));
+    });
+}
+
+pub fn remove_network(network_name: String, sender: Sender<WorkerEvent>) {
+    thread::spawn(move || {
+        let trimmed_name = network_name.trim().to_owned();
+        let result = remove_network_entry(&trimmed_name, &sender)
+            .map(|name| format!("Removed network `{name}`."))
+            .map_err(|err| format!("Network delete failed for `{trimmed_name}`: {err}"));
         let _ = sender.send(WorkerEvent::ActionFinished(result));
     });
 }

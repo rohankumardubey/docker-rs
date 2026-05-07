@@ -30,15 +30,18 @@ mod types;
 
 pub use self::tasks::{
     build_image, check_engine_status, check_runtime_status, compose_project_down,
-    compose_project_up, exec_in_container, fetch_container_logs, fetch_project_logs,
-    follow_container_logs, inspect_container, inspect_container_stats, inspect_image, pull_image,
-    refresh_containers, refresh_images, refresh_projects, remove_container, remove_image,
-    restart_container, run_container, start_container, start_runtime, stop_container,
+    compose_project_up, create_network, create_volume, exec_in_container, fetch_container_logs,
+    fetch_project_logs, follow_container_logs, inspect_container, inspect_container_stats,
+    inspect_image, inspect_network, inspect_volume, pull_image, refresh_containers, refresh_images,
+    refresh_networks, refresh_projects, refresh_volumes, remove_container, remove_image,
+    remove_network, remove_volume, restart_container, run_container, start_container,
+    start_runtime, stop_container,
 };
 use self::types::*;
 pub use self::types::{
     ContainerDetailsInfo, ContainerInfo, ContainerStatsInfo, DockerImageInfo, EngineStatusInfo,
-    ImageDetailsInfo, ProjectInfo, RuntimeStatusInfo, WorkerEvent,
+    ImageDetailsInfo, NetworkDetailsInfo, NetworkInfo, ProjectInfo, RuntimeStatusInfo,
+    VolumeDetailsInfo, VolumeInfo, WorkerEvent,
 };
 
 fn engine_status() -> Result<EngineStatusInfo> {
@@ -116,6 +119,46 @@ fn inspect_image_entry(image: &str) -> Result<ImageDetailsInfo> {
         working_dir: runtime.working_dir().clone().unwrap_or_default(),
         command: runtime.cmd().clone().unwrap_or_default().join(" "),
         entrypoint: runtime.entrypoint().clone().unwrap_or_default().join(" "),
+    })
+}
+
+fn inspect_volume_entry(volume_name: &str) -> Result<VolumeDetailsInfo> {
+    let paths = ensure_engine_paths()?;
+    let state = load_volume_state(&paths)?;
+    let row = state
+        .volumes
+        .into_iter()
+        .find(|volume| volume.name == volume_name)
+        .ok_or_else(|| anyhow!("volume `{volume_name}` was not found in the native store"))?;
+
+    Ok(VolumeDetailsInfo {
+        name: row.name,
+        driver: row.driver,
+        mountpoint: row.mountpoint,
+        scope: row.scope,
+        created_at: row.created_at,
+        labels: row.labels,
+        options: row.options,
+    })
+}
+
+fn inspect_network_entry(network_name: &str) -> Result<NetworkDetailsInfo> {
+    let paths = ensure_engine_paths()?;
+    let state = load_network_state(&paths)?;
+    let row = state
+        .networks
+        .into_iter()
+        .find(|network| network.name == network_name)
+        .ok_or_else(|| anyhow!("network `{network_name}` was not found in the native store"))?;
+
+    Ok(NetworkDetailsInfo {
+        name: row.name,
+        driver: row.driver,
+        subnet: row.subnet,
+        gateway: row.gateway,
+        scope: row.scope,
+        created_at: row.created_at,
+        labels: row.labels,
     })
 }
 
@@ -296,6 +339,41 @@ fn list_projects() -> Result<Vec<ProjectInfo>> {
 
     projects.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(projects)
+}
+
+fn list_volumes() -> Result<Vec<VolumeInfo>> {
+    let paths = ensure_engine_paths()?;
+    let state = load_volume_state(&paths)?;
+    let mut volumes = state
+        .volumes
+        .into_iter()
+        .map(|record| VolumeInfo {
+            name: record.name,
+            driver: record.driver,
+            mountpoint: record.mountpoint,
+            scope: record.scope,
+        })
+        .collect::<Vec<_>>();
+    volumes.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(volumes)
+}
+
+fn list_networks() -> Result<Vec<NetworkInfo>> {
+    let paths = ensure_engine_paths()?;
+    let state = load_network_state(&paths)?;
+    let mut networks = state
+        .networks
+        .into_iter()
+        .map(|record| NetworkInfo {
+            name: record.name,
+            driver: record.driver,
+            subnet: record.subnet,
+            gateway: record.gateway,
+            scope: record.scope,
+        })
+        .collect::<Vec<_>>();
+    networks.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(networks)
 }
 
 fn list_containers() -> Result<Vec<ContainerInfo>> {
@@ -857,6 +935,196 @@ fn fetch_project_logs_entry(
     }
 
     Ok(compose_project_display_name(compose_target, project_name))
+}
+
+fn create_volume_entry(
+    volume_name: &str,
+    driver: Option<&str>,
+    sender: &Sender<WorkerEvent>,
+) -> Result<String> {
+    if volume_name.trim().is_empty() {
+        bail!("volume name is required");
+    }
+    validate_volume_name(volume_name)?;
+
+    let paths = ensure_engine_paths()?;
+    let mut state = load_volume_state(&paths)?;
+    if state
+        .volumes
+        .iter()
+        .any(|volume| volume.name == volume_name)
+    {
+        bail!("volume `{volume_name}` already exists in the native store");
+    }
+
+    let selected_driver = driver
+        .map(str::trim)
+        .filter(|driver| !driver.is_empty())
+        .unwrap_or("local")
+        .to_string();
+    let mountpoint = native_volume_mountpoint(&paths, volume_name);
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "$ native-volume create {} --driver {}",
+        volume_name, selected_driver
+    )));
+
+    fs::create_dir_all(&mountpoint)
+        .with_context(|| format!("unable to create {}", mountpoint.display()))?;
+
+    state.volumes.push(NativeVolumeRecord {
+        name: volume_name.to_string(),
+        driver: selected_driver,
+        mountpoint: mountpoint.display().to_string(),
+        scope: String::from("local"),
+        created_at: now_epoch().to_string(),
+        labels: vec![(String::from("runtime"), String::from("native-volume-store"))],
+        options: Vec::new(),
+    });
+    state
+        .volumes
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    save_volume_state(&paths, &state)?;
+
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "Created native volume `{volume_name}` at {}.",
+        mountpoint.display()
+    )));
+    Ok(volume_name.to_string())
+}
+
+fn remove_volume_entry(volume_name: &str, sender: &Sender<WorkerEvent>) -> Result<String> {
+    if volume_name.trim().is_empty() {
+        bail!("volume name is required");
+    }
+    let paths = ensure_engine_paths()?;
+    let mut state = load_volume_state(&paths)?;
+    let Some(index) = state
+        .volumes
+        .iter()
+        .position(|volume| volume.name == volume_name)
+    else {
+        bail!("volume `{volume_name}` was not found in the native store");
+    };
+    let removed = state.volumes.remove(index);
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "$ native-volume rm {}",
+        volume_name
+    )));
+
+    let volume_root = native_volume_dir(&paths, volume_name);
+    if volume_root.exists() {
+        fs::remove_dir_all(&volume_root)
+            .with_context(|| format!("unable to remove {}", volume_root.display()))?;
+    }
+    save_volume_state(&paths, &state)?;
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "Removed native volume `{}` from {}.",
+        removed.name,
+        volume_root.display()
+    )));
+    Ok(volume_name.to_string())
+}
+
+fn create_network_entry(
+    network_name: &str,
+    driver: Option<&str>,
+    subnet: Option<&str>,
+    sender: &Sender<WorkerEvent>,
+) -> Result<String> {
+    if network_name.trim().is_empty() {
+        bail!("network name is required");
+    }
+    validate_network_name(network_name)?;
+
+    let paths = ensure_engine_paths()?;
+    let mut state = load_network_state(&paths)?;
+    if state
+        .networks
+        .iter()
+        .any(|network| network.name == network_name)
+    {
+        bail!("network `{network_name}` already exists in the native store");
+    }
+
+    let selected_driver = driver
+        .map(str::trim)
+        .filter(|driver| !driver.is_empty())
+        .unwrap_or("bridge")
+        .to_string();
+    let selected_subnet = subnet
+        .map(str::trim)
+        .filter(|subnet| !subnet.is_empty())
+        .unwrap_or("172.30.0.0/24")
+        .to_string();
+    validate_subnet_value(&selected_subnet)?;
+    let gateway = derive_gateway(&selected_subnet);
+    let network_root = native_network_dir(&paths, network_name);
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "$ native-network create {} --driver {} --subnet {}",
+        network_name, selected_driver, selected_subnet
+    )));
+
+    fs::create_dir_all(&network_root)
+        .with_context(|| format!("unable to create {}", network_root.display()))?;
+
+    state.networks.push(NativeNetworkRecord {
+        name: network_name.to_string(),
+        driver: selected_driver,
+        subnet: selected_subnet,
+        gateway: gateway.clone(),
+        scope: String::from("local"),
+        created_at: now_epoch().to_string(),
+        labels: vec![
+            (
+                String::from("runtime"),
+                String::from("native-network-store"),
+            ),
+            (String::from("gateway"), gateway),
+        ],
+    });
+    state
+        .networks
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    save_network_state(&paths, &state)?;
+
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "Created native network `{network_name}` at {}.",
+        network_root.display()
+    )));
+    Ok(network_name.to_string())
+}
+
+fn remove_network_entry(network_name: &str, sender: &Sender<WorkerEvent>) -> Result<String> {
+    if network_name.trim().is_empty() {
+        bail!("network name is required");
+    }
+    let paths = ensure_engine_paths()?;
+    let mut state = load_network_state(&paths)?;
+    let Some(index) = state
+        .networks
+        .iter()
+        .position(|network| network.name == network_name)
+    else {
+        bail!("network `{network_name}` was not found in the native store");
+    };
+    let removed = state.networks.remove(index);
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "$ native-network rm {}",
+        network_name
+    )));
+
+    let network_root = native_network_dir(&paths, network_name);
+    if network_root.exists() {
+        fs::remove_dir_all(&network_root)
+            .with_context(|| format!("unable to remove {}", network_root.display()))?;
+    }
+    save_network_state(&paths, &state)?;
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "Removed native network `{}` from {}.",
+        removed.name,
+        network_root.display()
+    )));
+    Ok(network_name.to_string())
 }
 
 fn follow_container_logs_entry(
@@ -2437,6 +2705,10 @@ fn ensure_engine_paths() -> Result<EnginePaths> {
     let manifests = root.join("manifests");
     let configs = root.join("configs");
     let metadata = root.join("images.json");
+    let volume_root = root.join("volumes");
+    let volume_metadata = root.join("volumes.json");
+    let network_root = root.join("networks");
+    let network_metadata = root.join("networks.json");
     let runtime_metadata = root.join("runtime.json");
     let runtime_logs = root.join("runtime-logs");
     let runtime_meta = root.join("runtime-meta");
@@ -2446,6 +2718,10 @@ fn ensure_engine_paths() -> Result<EnginePaths> {
         .with_context(|| format!("unable to create {}", manifests.display()))?;
     fs::create_dir_all(&configs)
         .with_context(|| format!("unable to create {}", configs.display()))?;
+    fs::create_dir_all(&volume_root)
+        .with_context(|| format!("unable to create {}", volume_root.display()))?;
+    fs::create_dir_all(&network_root)
+        .with_context(|| format!("unable to create {}", network_root.display()))?;
     fs::create_dir_all(&runtime_logs)
         .with_context(|| format!("unable to create {}", runtime_logs.display()))?;
     fs::create_dir_all(&runtime_meta)
@@ -2465,6 +2741,20 @@ fn ensure_engine_paths() -> Result<EnginePaths> {
         )
         .with_context(|| format!("unable to create {}", runtime_metadata.display()))?;
     }
+    if !volume_metadata.exists() {
+        fs::write(
+            &volume_metadata,
+            serde_json::to_vec_pretty(&NativeVolumeState::default())?,
+        )
+        .with_context(|| format!("unable to create {}", volume_metadata.display()))?;
+    }
+    if !network_metadata.exists() {
+        fs::write(
+            &network_metadata,
+            serde_json::to_vec_pretty(&NativeNetworkState::default())?,
+        )
+        .with_context(|| format!("unable to create {}", network_metadata.display()))?;
+    }
 
     Ok(EnginePaths {
         root,
@@ -2472,6 +2762,10 @@ fn ensure_engine_paths() -> Result<EnginePaths> {
         manifests,
         configs,
         metadata,
+        volume_root,
+        volume_metadata,
+        network_root,
+        network_metadata,
         runtime_metadata,
         runtime_logs,
         runtime_meta,
@@ -2503,6 +2797,116 @@ fn save_runtime_state(paths: &EnginePaths, state: &NativeRuntimeState) -> Result
     fs::write(&paths.runtime_metadata, content)
         .with_context(|| format!("unable to write {}", paths.runtime_metadata.display()))?;
     Ok(())
+}
+
+fn load_volume_state(paths: &EnginePaths) -> Result<NativeVolumeState> {
+    let text = fs::read_to_string(&paths.volume_metadata)
+        .with_context(|| format!("unable to read {}", paths.volume_metadata.display()))?;
+    Ok(serde_json::from_str(&text).context("invalid native volume metadata file")?)
+}
+
+fn save_volume_state(paths: &EnginePaths, state: &NativeVolumeState) -> Result<()> {
+    let content =
+        serde_json::to_vec_pretty(state).context("unable to encode native volume state")?;
+    fs::write(&paths.volume_metadata, content)
+        .with_context(|| format!("unable to write {}", paths.volume_metadata.display()))?;
+    Ok(())
+}
+
+fn load_network_state(paths: &EnginePaths) -> Result<NativeNetworkState> {
+    let text = fs::read_to_string(&paths.network_metadata)
+        .with_context(|| format!("unable to read {}", paths.network_metadata.display()))?;
+    Ok(serde_json::from_str(&text).context("invalid native network metadata file")?)
+}
+
+fn save_network_state(paths: &EnginePaths, state: &NativeNetworkState) -> Result<()> {
+    let content =
+        serde_json::to_vec_pretty(state).context("unable to encode native network state")?;
+    fs::write(&paths.network_metadata, content)
+        .with_context(|| format!("unable to write {}", paths.network_metadata.display()))?;
+    Ok(())
+}
+
+fn validate_volume_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("volume name is required");
+    }
+    if trimmed.starts_with('.') || trimmed.contains('/') || trimmed.contains('\\') {
+        bail!("volume name cannot contain path separators or start with `.`");
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        bail!("volume name may only contain letters, numbers, `.`, `_`, or `-`");
+    }
+    Ok(())
+}
+
+fn validate_network_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("network name is required");
+    }
+    if trimmed.starts_with('.') || trimmed.contains('/') || trimmed.contains('\\') {
+        bail!("network name cannot contain path separators or start with `.`");
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        bail!("network name may only contain letters, numbers, `.`, `_`, or `-`");
+    }
+    Ok(())
+}
+
+fn validate_subnet_value(value: &str) -> Result<()> {
+    let Some((base, prefix)) = value.split_once('/') else {
+        bail!("subnet must be in CIDR form, e.g. 172.30.0.0/24");
+    };
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| anyhow!("subnet prefix must be a number"))?;
+    if prefix > 32 {
+        bail!("subnet prefix must be between 0 and 32");
+    }
+    let octets = base.split('.').collect::<Vec<_>>();
+    if octets.len() != 4 {
+        bail!("subnet base must be an IPv4 address");
+    }
+    for octet in octets {
+        let _: u8 = octet
+            .parse()
+            .map_err(|_| anyhow!("subnet base must contain only IPv4 octets"))?;
+    }
+    Ok(())
+}
+
+fn native_volume_dir(paths: &EnginePaths, volume_name: &str) -> PathBuf {
+    paths.volume_root.join(volume_name)
+}
+
+fn native_volume_mountpoint(paths: &EnginePaths, volume_name: &str) -> PathBuf {
+    native_volume_dir(paths, volume_name).join("data")
+}
+
+fn native_network_dir(paths: &EnginePaths, network_name: &str) -> PathBuf {
+    paths.network_root.join(network_name)
+}
+
+fn derive_gateway(subnet: &str) -> String {
+    if let Some((base, _)) = subnet.split_once('/') {
+        let mut octets = base
+            .split('.')
+            .map(|segment| segment.parse::<u8>().unwrap_or(0))
+            .collect::<Vec<_>>();
+        if octets.len() == 4 {
+            octets[3] = 1;
+            return format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+        }
+    }
+    String::from("-")
 }
 
 fn upsert_record(paths: &EnginePaths, record: StoredImageRecord) -> Result<()> {

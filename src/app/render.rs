@@ -427,6 +427,390 @@ impl DockerDesktopApp {
         });
     }
 
+    fn render_volumes_panel(&mut self, ui: &mut egui::Ui) {
+        let max_height = (ui.available_height() - 280.0).max(180.0);
+        ui.horizontal(|ui| {
+            ui.heading("Volumes");
+            ui.label(filtered_total_label(
+                filtered_volumes(&self.volumes, &self.volume_filter).len(),
+                self.volumes.len(),
+            ));
+        });
+        ui.add_space(8.0);
+        ui.colored_label(
+            Color32::from_rgb(46, 204, 113),
+            "Volumes are stored natively inside Docker RS Desktop.",
+        );
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Create Volume");
+            ui.add_space(8.0);
+            ui.add(TextEdit::singleline(&mut self.volume_name_input).hint_text("my-volume"));
+            ui.add_space(6.0);
+            ui.add(
+                TextEdit::singleline(&mut self.volume_driver_input).hint_text("Driver, e.g. local"),
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        self.running_task.is_none(),
+                        egui::Button::new("Create Volume"),
+                    )
+                    .clicked()
+                {
+                    self.create_volume_action();
+                }
+                if ui.button("Clear").clicked() {
+                    self.volume_name_input.clear();
+                    self.volume_driver_input = String::from("local");
+                }
+            });
+        });
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            ui.add(
+                TextEdit::singleline(&mut self.volume_filter)
+                    .hint_text("name, driver, mountpoint, or scope"),
+            );
+            if ui.button("Clear").clicked() {
+                self.volume_filter.clear();
+            }
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ScrollArea::vertical()
+                .id_salt("volumes_scroll")
+                .max_height(max_height)
+                .show(ui, |ui| {
+                    egui::Grid::new("volumes_grid")
+                        .striped(true)
+                        .min_col_width(80.0)
+                        .show(ui, |ui| {
+                            ui.strong("Name");
+                            ui.strong("Driver");
+                            ui.strong("Mountpoint");
+                            ui.strong("Scope");
+                            ui.strong("Actions");
+                            ui.end_row();
+
+                            let volumes = filtered_volumes(&self.volumes, &self.volume_filter);
+                            for volume in volumes {
+                                let selected = self.selected_volume_name.as_deref()
+                                    == Some(volume.name.as_str());
+                                if selected {
+                                    ui.colored_label(
+                                        Color32::from_rgb(52, 152, 219),
+                                        RichText::new(&volume.name).strong(),
+                                    );
+                                } else {
+                                    ui.label(&volume.name);
+                                }
+                                ui.label(&volume.driver);
+                                ui.label(compact_path(&volume.mountpoint));
+                                ui.label(&volume.scope);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            self.running_task.is_none(),
+                                            egui::Button::new("Inspect"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.inspect_volume_action(volume.name.clone());
+                                    }
+                                    ui.menu_button("More", |ui| {
+                                        if ui
+                                            .add_enabled(
+                                                self.running_task.is_none(),
+                                                egui::Button::new("Delete"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.remove_volume_action(volume.name.clone());
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    }
+
+    fn render_volume_details(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Volume Details");
+            if let Some(details) = self.selected_volume_details.as_ref() {
+                let volume_name = details.name.clone();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(self.running_task.is_none(), egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        self.remove_volume_action(volume_name.clone());
+                    }
+                    if ui
+                        .add_enabled(
+                            self.running_task.is_none(),
+                            egui::Button::new("Refresh Details"),
+                        )
+                        .clicked()
+                    {
+                        self.inspect_volume_action(volume_name.clone());
+                    }
+                });
+            }
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if let Some(details) = self.selected_volume_details.as_ref() {
+                egui::Grid::new("volume_details_meta")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        detail_row(ui, "Name", &details.name);
+                        detail_row(ui, "Driver", &details.driver);
+                        detail_row(ui, "Mountpoint", &details.mountpoint);
+                        detail_row(ui, "Scope", &details.scope);
+                        detail_row(ui, "Created", &details.created_at);
+                    });
+
+                ui.add_space(12.0);
+                ui.heading("Labels");
+                if details.labels.is_empty() {
+                    ui.label("No labels reported.");
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt("volume_labels_scroll")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for (key, value) in &details.labels {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.monospace(key);
+                                    ui.label(value);
+                                });
+                            }
+                        });
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Options");
+                if details.options.is_empty() {
+                    ui.label("No driver options reported.");
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt("volume_options_scroll")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for (key, value) in &details.options {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.monospace(key);
+                                    ui.label(value);
+                                });
+                            }
+                        });
+                }
+            } else {
+                ui.label("Choose `Inspect` on a volume row to load full details here.");
+            }
+        });
+    }
+
+    fn render_networks_panel(&mut self, ui: &mut egui::Ui) {
+        let max_height = (ui.available_height() - 280.0).max(180.0);
+        ui.horizontal(|ui| {
+            ui.heading("Networks");
+            ui.label(filtered_total_label(
+                filtered_networks(&self.networks, &self.network_filter).len(),
+                self.networks.len(),
+            ));
+        });
+        ui.add_space(8.0);
+        ui.colored_label(
+            Color32::from_rgb(46, 204, 113),
+            "Networks are stored natively inside Docker RS Desktop.",
+        );
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Create Network");
+            ui.add_space(8.0);
+            ui.add(TextEdit::singleline(&mut self.network_name_input).hint_text("app-network"));
+            ui.add_space(6.0);
+            ui.add(
+                TextEdit::singleline(&mut self.network_driver_input)
+                    .hint_text("Driver, e.g. bridge"),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                TextEdit::singleline(&mut self.network_subnet_input)
+                    .hint_text("Subnet, e.g. 172.30.0.0/24"),
+            );
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        self.running_task.is_none(),
+                        egui::Button::new("Create Network"),
+                    )
+                    .clicked()
+                {
+                    self.create_network_action();
+                }
+                if ui.button("Clear").clicked() {
+                    self.network_name_input.clear();
+                    self.network_driver_input = String::from("bridge");
+                    self.network_subnet_input = String::from("172.30.0.0/24");
+                }
+            });
+        });
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            ui.add(
+                TextEdit::singleline(&mut self.network_filter)
+                    .hint_text("name, driver, subnet, gateway, or scope"),
+            );
+            if ui.button("Clear").clicked() {
+                self.network_filter.clear();
+            }
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ScrollArea::vertical()
+                .id_salt("networks_scroll")
+                .max_height(max_height)
+                .show(ui, |ui| {
+                    egui::Grid::new("networks_grid")
+                        .striped(true)
+                        .min_col_width(72.0)
+                        .show(ui, |ui| {
+                            ui.strong("Name");
+                            ui.strong("Driver");
+                            ui.strong("Subnet");
+                            ui.strong("Gateway");
+                            ui.strong("Scope");
+                            ui.strong("Actions");
+                            ui.end_row();
+
+                            let networks = filtered_networks(&self.networks, &self.network_filter);
+                            for network in networks {
+                                let selected = self.selected_network_name.as_deref()
+                                    == Some(network.name.as_str());
+                                if selected {
+                                    ui.colored_label(
+                                        Color32::from_rgb(52, 152, 219),
+                                        RichText::new(&network.name).strong(),
+                                    );
+                                } else {
+                                    ui.label(&network.name);
+                                }
+                                ui.label(&network.driver);
+                                ui.label(&network.subnet);
+                                ui.label(&network.gateway);
+                                ui.label(&network.scope);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            self.running_task.is_none(),
+                                            egui::Button::new("Inspect"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.inspect_network_action(network.name.clone());
+                                    }
+                                    ui.menu_button("More", |ui| {
+                                        if ui
+                                            .add_enabled(
+                                                self.running_task.is_none(),
+                                                egui::Button::new("Delete"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.remove_network_action(network.name.clone());
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    }
+
+    fn render_network_details(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Network Details");
+            if let Some(details) = self.selected_network_details.as_ref() {
+                let network_name = details.name.clone();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(self.running_task.is_none(), egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        self.remove_network_action(network_name.clone());
+                    }
+                    if ui
+                        .add_enabled(
+                            self.running_task.is_none(),
+                            egui::Button::new("Refresh Details"),
+                        )
+                        .clicked()
+                    {
+                        self.inspect_network_action(network_name.clone());
+                    }
+                });
+            }
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if let Some(details) = self.selected_network_details.as_ref() {
+                egui::Grid::new("network_details_meta")
+                    .num_columns(2)
+                    .spacing([16.0, 8.0])
+                    .show(ui, |ui| {
+                        detail_row(ui, "Name", &details.name);
+                        detail_row(ui, "Driver", &details.driver);
+                        detail_row(ui, "Subnet", &details.subnet);
+                        detail_row(ui, "Gateway", &details.gateway);
+                        detail_row(ui, "Scope", &details.scope);
+                        detail_row(ui, "Created", &details.created_at);
+                    });
+
+                ui.add_space(12.0);
+                ui.heading("Labels");
+                if details.labels.is_empty() {
+                    ui.label("No labels reported.");
+                } else {
+                    ScrollArea::vertical()
+                        .id_salt("network_labels_scroll")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for (key, value) in &details.labels {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.monospace(key);
+                                    ui.label(value);
+                                });
+                            }
+                        });
+                }
+            } else {
+                ui.label("Choose `Inspect` on a network row to load full details here.");
+            }
+        });
+    }
+
     fn render_project_details(&mut self, ui: &mut egui::Ui) {
         let selected_project = self
             .selected_project_name
@@ -948,6 +1332,18 @@ impl DockerDesktopApp {
         );
         self.render_nav_button(
             ui,
+            WorkspaceTab::Volumes,
+            "Volumes",
+            &format!("{} local", self.volumes.len()),
+        );
+        self.render_nav_button(
+            ui,
+            WorkspaceTab::Networks,
+            "Networks",
+            &format!("{} local", self.networks.len()),
+        );
+        self.render_nav_button(
+            ui,
             WorkspaceTab::Containers,
             "Containers",
             &format!("{} total", self.containers.len()),
@@ -1024,6 +1420,8 @@ impl DockerDesktopApp {
                     .to_string(),
             );
             stat_line(ui, "Projects", &self.projects.len().to_string());
+            stat_line(ui, "Volumes", &self.volumes.len().to_string());
+            stat_line(ui, "Networks", &self.networks.len().to_string());
             stat_line(ui, "Images", &self.images.len().to_string());
         });
 
@@ -1031,7 +1429,7 @@ impl DockerDesktopApp {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.strong("Shortcuts");
             ui.add_space(6.0);
-            ui.small("Cmd/Ctrl+1..6 switch pages");
+            ui.small("Cmd/Ctrl+1..8 switch pages");
             ui.small("Esc goes back");
             ui.small("Cmd/Ctrl+R refreshes");
         });
@@ -1061,6 +1459,8 @@ impl DockerDesktopApp {
             }
             self.render_toolbar_tab(ui, WorkspaceTab::Home, "Home");
             self.render_toolbar_tab(ui, WorkspaceTab::Projects, "Projects");
+            self.render_toolbar_tab(ui, WorkspaceTab::Volumes, "Volumes");
+            self.render_toolbar_tab(ui, WorkspaceTab::Networks, "Networks");
             self.render_toolbar_tab(ui, WorkspaceTab::Containers, "Containers");
             self.render_toolbar_tab(ui, WorkspaceTab::Images, "Images");
             self.render_toolbar_tab(ui, WorkspaceTab::Build, "Build & Run");
@@ -1188,6 +1588,8 @@ impl DockerDesktopApp {
         match self.workspace_tab {
             WorkspaceTab::Home => self.render_home_page(ui),
             WorkspaceTab::Projects => self.render_projects_page(ui),
+            WorkspaceTab::Volumes => self.render_volumes_page(ui),
+            WorkspaceTab::Networks => self.render_networks_page(ui),
             WorkspaceTab::Containers => self.render_containers_page(ui),
             WorkspaceTab::Images => self.render_images_page(ui),
             WorkspaceTab::Build => self.render_build_page(ui),
@@ -1213,6 +1615,8 @@ impl DockerDesktopApp {
                 );
                 stat_line(ui, "Total containers", &self.containers.len().to_string());
                 stat_line(ui, "Compose projects", &self.projects.len().to_string());
+                stat_line(ui, "Named volumes", &self.volumes.len().to_string());
+                stat_line(ui, "Native networks", &self.networks.len().to_string());
                 stat_line(ui, "Local images", &self.images.len().to_string());
                 stat_line(
                     ui,
@@ -1236,6 +1640,12 @@ impl DockerDesktopApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Open Projects").clicked() {
                         self.navigate_to(WorkspaceTab::Projects);
+                    }
+                    if ui.button("Open Volumes").clicked() {
+                        self.navigate_to(WorkspaceTab::Volumes);
+                    }
+                    if ui.button("Open Networks").clicked() {
+                        self.navigate_to(WorkspaceTab::Networks);
                     }
                     if ui.button("Open Containers").clicked() {
                         self.navigate_to(WorkspaceTab::Containers);
@@ -1324,6 +1734,36 @@ impl DockerDesktopApp {
                     .id_salt("project_details_page")
                     .show(ui, |ui| {
                         self.render_project_details(ui);
+                    });
+            });
+        });
+    }
+
+    fn render_volumes_page(&mut self, ui: &mut egui::Ui) {
+        ui.columns(2, |columns| {
+            egui::Frame::group(columns[0].style()).show(&mut columns[0], |ui| {
+                self.render_volumes_panel(ui);
+            });
+            egui::Frame::group(columns[1].style()).show(&mut columns[1], |ui| {
+                ScrollArea::vertical()
+                    .id_salt("volume_details_page")
+                    .show(ui, |ui| {
+                        self.render_volume_details(ui);
+                    });
+            });
+        });
+    }
+
+    fn render_networks_page(&mut self, ui: &mut egui::Ui) {
+        ui.columns(2, |columns| {
+            egui::Frame::group(columns[0].style()).show(&mut columns[0], |ui| {
+                self.render_networks_panel(ui);
+            });
+            egui::Frame::group(columns[1].style()).show(&mut columns[1], |ui| {
+                ScrollArea::vertical()
+                    .id_salt("network_details_page")
+                    .show(ui, |ui| {
+                        self.render_network_details(ui);
                     });
             });
         });
