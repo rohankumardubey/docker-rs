@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -13,12 +13,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use dockerfile_parser::{Dockerfile, Instruction};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use oci_client::client::ClientConfig;
 use oci_client::manifest::ImageIndexEntry;
 use oci_client::{Client, Reference, secrets::RegistryAuth};
 use oci_spec::image::{
-    Arch, Config, DescriptorBuilder, Digest as OciDigest, HistoryBuilder, ImageConfiguration,
-    ImageManifest, MediaType, Os,
+    Arch, Config, Descriptor, DescriptorBuilder, Digest as OciDigest, HistoryBuilder,
+    ImageConfiguration, ImageManifest, MediaType, Os,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2681,7 +2683,14 @@ fn native_build_entry(
     let mut manifest = load_manifest(&paths, &base_record.manifest_digest)?;
     let mut image_config = load_config(&paths, &base_record.config_digest)?;
 
-    apply_supported_instructions(&parsed, &mut image_config)?;
+    apply_dockerfile_instructions(
+        &parsed,
+        prepared.root(),
+        &paths,
+        &mut image_config,
+        &mut manifest,
+        sender,
+    )?;
 
     let config_json = image_config
         .to_string()
@@ -2875,14 +2884,20 @@ fn native_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
         .map(|entry| entry.digest.clone())
 }
 
-fn apply_supported_instructions(
+fn apply_dockerfile_instructions(
     dockerfile: &Dockerfile,
+    context_root: &Path,
+    paths: &EnginePaths,
     image_config: &mut ImageConfiguration,
+    manifest: &mut ImageManifest,
+    sender: &Sender<WorkerEvent>,
 ) -> Result<()> {
     let mut saw_first_from = false;
     let mut unsupported = Vec::new();
     let mut runtime_config = image_config.config().clone().unwrap_or_default();
     let mut history = image_config.history().clone().unwrap_or_default();
+    let mut layer_descriptors: Vec<Descriptor> = manifest.layers().clone();
+    let mut diff_ids: Vec<String> = image_config.rootfs().diff_ids().clone();
 
     for instruction in &dockerfile.instructions {
         match instruction {
@@ -2919,7 +2934,28 @@ fn apply_supported_instructions(
                 unsupported.push(format!("RUN {}", run_to_string(run)))
             }
             Instruction::Copy(copy) if saw_first_from => {
-                unsupported.push(format!("COPY {}", copy.sources.len()))
+                match build_copy_layer(context_root, paths, copy, &runtime_config, sender) {
+                    Ok(Some(layer)) => {
+                        layer_descriptors.push(layer.descriptor);
+                        diff_ids.push(layer.diff_id);
+                        history.push(history_entry_layer(&format!(
+                            "COPY {}",
+                            copy_to_string(copy)
+                        )));
+                    }
+                    Ok(None) => {
+                        // No-op COPY (zero files matched after expansion); record as empty.
+                        history.push(history_entry(&format!(
+                            "COPY {} # (no files matched)",
+                            copy_to_string(copy)
+                        )));
+                    }
+                    Err(err) => unsupported.push(format!(
+                        "COPY {} ({})",
+                        copy_to_string(copy),
+                        err
+                    )),
+                }
             }
             _ => {}
         }
@@ -2927,13 +2963,15 @@ fn apply_supported_instructions(
 
     if !unsupported.is_empty() {
         bail!(
-            "native builder currently supports only metadata-changing Dockerfiles. Unsupported instructions: {}",
+            "native builder cannot handle these Dockerfile instructions yet: {}",
             unsupported.join(", ")
         );
     }
 
     image_config.set_config(Some(runtime_config));
     image_config.set_history(Some(history));
+    image_config.rootfs_mut().set_diff_ids(diff_ids);
+    manifest.set_layers(layer_descriptors);
     Ok(())
 }
 
@@ -3093,6 +3131,449 @@ fn run_to_string(instruction: &dockerfile_parser::RunInstruction) -> String {
             .map(|value| value.to_string())
             .unwrap_or_default()
     }
+}
+
+fn copy_to_string(instruction: &dockerfile_parser::CopyInstruction) -> String {
+    let flags = instruction
+        .flags
+        .iter()
+        .map(|flag| format!("--{}={}", flag.name.content, flag.value.content))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let sources = instruction
+        .sources
+        .iter()
+        .map(|source| source.content.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flags.is_empty() {
+        format!("{} {}", sources, instruction.destination.content)
+    } else {
+        format!(
+            "{} {} {}",
+            flags, sources, instruction.destination.content
+        )
+    }
+}
+
+fn history_entry_layer(command: &str) -> oci_spec::image::History {
+    HistoryBuilder::default()
+        .created_by(command.to_string())
+        .empty_layer(false)
+        .build()
+        .expect("history entry build should not fail")
+}
+
+struct BuiltLayer {
+    descriptor: Descriptor,
+    diff_id: String,
+}
+
+#[derive(Default, Clone)]
+struct CopyOptions {
+    chown_uid: u64,
+    chown_gid: u64,
+    chmod: Option<u32>,
+}
+
+fn parse_copy_flags(
+    instruction: &dockerfile_parser::CopyInstruction,
+) -> Result<CopyOptions> {
+    let mut opts = CopyOptions::default();
+    for flag in &instruction.flags {
+        let name = flag.name.content.as_str();
+        let value = flag.value.content.as_str();
+        match name {
+            "chown" => {
+                let (uid, gid) = if let Some((u, g)) = value.split_once(':') {
+                    (u, g)
+                } else {
+                    (value, value)
+                };
+                opts.chown_uid = uid
+                    .parse::<u64>()
+                    .with_context(|| format!("--chown owner `{uid}` must be numeric (named users not supported yet)"))?;
+                opts.chown_gid = gid
+                    .parse::<u64>()
+                    .with_context(|| format!("--chown group `{gid}` must be numeric (named groups not supported yet)"))?;
+            }
+            "chmod" => {
+                let mode = u32::from_str_radix(value, 8)
+                    .with_context(|| format!("--chmod value `{value}` must be octal"))?;
+                opts.chmod = Some(mode);
+            }
+            "from" => {
+                bail!("--from=<stage|image> is not supported yet");
+            }
+            "link" => {
+                // --link is a buildkit optimization; safe to ignore.
+            }
+            other => bail!("--{other} flag is not supported yet"),
+        }
+    }
+    Ok(opts)
+}
+
+fn build_copy_layer(
+    context_root: &Path,
+    paths: &EnginePaths,
+    instruction: &dockerfile_parser::CopyInstruction,
+    runtime_config: &Config,
+    sender: &Sender<WorkerEvent>,
+) -> Result<Option<BuiltLayer>> {
+    let opts = parse_copy_flags(instruction)?;
+    let workdir = runtime_config
+        .working_dir()
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("/"));
+
+    let destination_raw = instruction.destination.content.trim();
+    if destination_raw.is_empty() {
+        bail!("destination is required");
+    }
+    let dest_is_dir = destination_raw.ends_with('/') || instruction.sources.len() > 1;
+    let destination = normalize_dest(&workdir, destination_raw);
+
+    // Expand sources (with glob), in the order they appear, against the build context.
+    let mut staged: Vec<StagedEntry> = Vec::new();
+    for source in &instruction.sources {
+        let raw = source.content.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            bail!("URL sources are not supported yet (use ADD for URLs in a future release)");
+        }
+        if raw.starts_with('/') || raw.starts_with("..") || raw.contains("../") {
+            bail!("source `{raw}` must be inside the build context");
+        }
+        let matches = expand_source(context_root, raw)?;
+        if matches.is_empty() {
+            bail!("source `{raw}` did not match any files in the build context");
+        }
+        for matched in matches {
+            collect_entries(&matched, &destination, dest_is_dir, &mut staged)?;
+        }
+    }
+
+    if staged.is_empty() {
+        return Ok(None);
+    }
+
+    // Deterministic order so digests are stable across runs.
+    staged.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
+    staged.dedup_by(|a, b| a.archive_path == b.archive_path);
+
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "COPY: staging {} entr{} into layer (dest `{}`)",
+        staged.len(),
+        if staged.len() == 1 { "y" } else { "ies" },
+        destination
+    )));
+
+    let layer = write_layer_blob(paths, &staged, &opts)?;
+    let _ = sender.send(WorkerEvent::LogLine(format!(
+        "COPY: wrote layer {} ({}), diff_id {}",
+        shorten_digest(layer.descriptor.digest().as_ref()),
+        format_bytes(layer.descriptor.size()),
+        shorten_digest(&layer.diff_id),
+    )));
+    Ok(Some(layer))
+}
+
+fn normalize_dest(workdir: &str, dest: &str) -> String {
+    let combined = if dest.starts_with('/') {
+        dest.to_string()
+    } else {
+        let base = if workdir.ends_with('/') {
+            workdir.to_string()
+        } else {
+            format!("{workdir}/")
+        };
+        format!("{base}{dest}")
+    };
+    // Strip leading slashes so the archive contains relative paths inside the rootfs.
+    combined.trim_start_matches('/').to_string()
+}
+
+fn expand_source(context_root: &Path, raw: &str) -> Result<Vec<PathBuf>> {
+    if raw.contains('*') || raw.contains('?') || raw.contains('[') {
+        let pattern = context_root.join(raw);
+        let pattern_str = pattern
+            .to_str()
+            .ok_or_else(|| anyhow!("source pattern contains invalid utf-8"))?;
+        let entries = glob::glob(pattern_str)
+            .with_context(|| format!("invalid source pattern `{raw}`"))?;
+        let mut out = Vec::new();
+        for entry in entries {
+            out.push(entry.with_context(|| format!("failed to read glob entry for `{raw}`"))?);
+        }
+        Ok(out)
+    } else {
+        let path = context_root.join(raw);
+        if !path.exists() {
+            bail!("source `{raw}` not found in build context");
+        }
+        Ok(vec![path])
+    }
+}
+
+struct StagedEntry {
+    source: PathBuf,
+    archive_path: String,
+    is_dir: bool,
+}
+
+fn collect_entries(
+    source: &Path,
+    destination: &str,
+    dest_is_dir: bool,
+    out: &mut Vec<StagedEntry>,
+) -> Result<()> {
+    let meta = fs::symlink_metadata(source)
+        .with_context(|| format!("unable to stat {}", source.display()))?;
+    if meta.is_symlink() {
+        bail!(
+            "symlink sources are not supported yet (`{}`)",
+            source.display()
+        );
+    }
+
+    if meta.is_file() {
+        let dest_path = if dest_is_dir {
+            let name = source
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            format!("{}/{}", destination.trim_end_matches('/'), name)
+        } else {
+            destination.to_string()
+        };
+        out.push(StagedEntry {
+            source: source.to_path_buf(),
+            archive_path: dest_path.trim_start_matches('/').to_string(),
+            is_dir: false,
+        });
+        return Ok(());
+    }
+
+    if !meta.is_dir() {
+        bail!("unsupported file type at {}", source.display());
+    }
+
+    // For directories, mirror their contents under `destination` (matching Docker semantics
+    // when destination has a trailing slash). The directory itself is implicitly created.
+    let base_dest = destination.trim_end_matches('/').to_string();
+    out.push(StagedEntry {
+        source: source.to_path_buf(),
+        archive_path: base_dest.clone(),
+        is_dir: true,
+    });
+    walk_dir(source, source, &base_dest, out)?;
+    Ok(())
+}
+
+fn walk_dir(
+    base: &Path,
+    current: &Path,
+    base_archive: &str,
+    out: &mut Vec<StagedEntry>,
+) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(current)
+        .with_context(|| format!("unable to read {}", current.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("unable to enumerate {}", current.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("unable to stat {}", path.display()))?;
+        if meta.is_symlink() {
+            // Skip symlinks for now rather than fail an entire build.
+            continue;
+        }
+        let rel = path
+            .strip_prefix(base)
+            .with_context(|| format!("path {} escaped {}", path.display(), base.display()))?;
+        let rel_str = rel
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 path {}", rel.display()))?;
+        let archive_path = if base_archive.is_empty() {
+            rel_str.to_string()
+        } else {
+            format!("{}/{}", base_archive, rel_str)
+        };
+        if meta.is_dir() {
+            out.push(StagedEntry {
+                source: path.clone(),
+                archive_path: archive_path.clone(),
+                is_dir: true,
+            });
+            walk_dir(base, &path, base_archive, out)?;
+        } else if meta.is_file() {
+            out.push(StagedEntry {
+                source: path,
+                archive_path,
+                is_dir: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_layer_blob(
+    paths: &EnginePaths,
+    staged: &[StagedEntry],
+    opts: &CopyOptions,
+) -> Result<BuiltLayer> {
+    // Build the uncompressed tar fully in memory so we can compute its sha256 (diff_id),
+    // then gzip-encode it to a temp file under blobs/ and compute the compressed sha256
+    // (content digest) on the way out.
+    let mut tar_bytes: Vec<u8> = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        builder.mode(tar::HeaderMode::Deterministic);
+        for entry in staged {
+            append_entry(&mut builder, entry, opts)?;
+        }
+        builder.finish().context("failed to finalize tar layer")?;
+    }
+    let diff_id = sha256_digest(&tar_bytes);
+
+    let blobs_root = paths.blobs.join("sha256");
+    fs::create_dir_all(&blobs_root)
+        .with_context(|| format!("unable to create {}", blobs_root.display()))?;
+    let tmp = tempfile::NamedTempFile::new_in(&blobs_root)
+        .with_context(|| format!("unable to create temp file in {}", blobs_root.display()))?;
+    let (tmp_file, tmp_path) = tmp.into_parts();
+    let mut hasher = Sha256::new();
+    {
+        let mut encoder = GzEncoder::new(HashingWriter::new(tmp_file, &mut hasher), Compression::default());
+        encoder
+            .write_all(&tar_bytes)
+            .context("failed to gzip layer bytes")?;
+        encoder.finish().context("failed to finish gzip stream")?;
+    }
+    let compressed_digest = format!("sha256:{:x}", hasher.finalize());
+    let final_path = digest_blob_path(&paths.blobs, &compressed_digest)?;
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+    }
+    if final_path.exists() {
+        // Identical layer already in the store; drop the temp file.
+        fs::remove_file(&tmp_path).ok();
+    } else {
+        fs::rename(&tmp_path, &final_path).with_context(|| {
+            format!(
+                "unable to publish layer blob {} -> {}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+    }
+    let size = fs::metadata(&final_path)
+        .with_context(|| format!("unable to stat {}", final_path.display()))?
+        .len();
+
+    let descriptor = DescriptorBuilder::default()
+        .media_type(MediaType::ImageLayerGzip)
+        .digest(
+            compressed_digest
+                .parse::<OciDigest>()
+                .context("invalid generated layer digest")?,
+        )
+        .size(size)
+        .build()
+        .context("unable to build layer descriptor")?;
+
+    Ok(BuiltLayer {
+        descriptor,
+        diff_id,
+    })
+}
+
+struct HashingWriter<'a, W: std::io::Write> {
+    inner: W,
+    hasher: &'a mut Sha256,
+}
+
+impl<'a, W: std::io::Write> HashingWriter<'a, W> {
+    fn new(inner: W, hasher: &'a mut Sha256) -> Self {
+        Self { inner, hasher }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn append_entry<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    entry: &StagedEntry,
+    opts: &CopyOptions,
+) -> Result<()> {
+    if entry.archive_path.is_empty() {
+        return Ok(());
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_uid(opts.chown_uid);
+    header.set_gid(opts.chown_gid);
+    header.set_mtime(0);
+
+    if entry.is_dir {
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(opts.chmod.unwrap_or(0o755));
+        header
+            .set_path(format!("{}/", entry.archive_path.trim_end_matches('/')))
+            .with_context(|| format!("unable to set tar path for {}", entry.archive_path))?;
+        header.set_cksum();
+        builder
+            .append(&header, std::io::empty())
+            .with_context(|| format!("unable to append directory {}", entry.archive_path))?;
+    } else {
+        let mut file = File::open(&entry.source)
+            .with_context(|| format!("unable to open {}", entry.source.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("unable to stat {}", entry.source.display()))?;
+        let mode = opts.chmod.unwrap_or_else(|| {
+            // Default to executable-preserving 0644/0755 based on source mode where available;
+            // on platforms without unix perms, fall back to 0644.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let raw = meta.permissions().mode() & 0o777;
+                if raw & 0o111 != 0 { 0o755 } else { 0o644 }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &meta;
+                0o644
+            }
+        });
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(meta.len());
+        header.set_mode(mode);
+        header
+            .set_path(&entry.archive_path)
+            .with_context(|| format!("unable to set tar path for {}", entry.archive_path))?;
+        header.set_cksum();
+        builder
+            .append(&header, &mut file)
+            .with_context(|| format!("unable to append file {}", entry.archive_path))?;
+    }
+    Ok(())
 }
 
 fn ensure_engine_paths() -> Result<EnginePaths> {
@@ -3601,6 +4082,39 @@ mod tests {
 
     use super::*;
 
+    fn empty_engine_paths(tmp: &Path) -> EnginePaths {
+        EnginePaths {
+            root: tmp.to_path_buf(),
+            blobs: tmp.join("blobs"),
+            manifests: tmp.join("manifests"),
+            configs: tmp.join("configs"),
+            metadata: tmp.join("metadata"),
+            volume_root: tmp.join("volumes"),
+            volume_metadata: tmp.join("volume-meta"),
+            network_root: tmp.join("networks"),
+            network_metadata: tmp.join("network-meta"),
+            runtime_metadata: tmp.join("runtime-meta"),
+            runtime_logs: tmp.join("runtime-logs"),
+            runtime_meta: tmp.join("runtime-meta-2"),
+        }
+    }
+
+    fn empty_manifest() -> ImageManifest {
+        serde_json::from_str(
+            r#"{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "size": 0
+  },
+  "layers": []
+}"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn metadata_only_builder_updates_runtime_config() {
         let dockerfile = Dockerfile::parse(
@@ -3632,7 +4146,19 @@ ENTRYPOINT ["/bin/demo"]
         )
         .unwrap();
 
-        apply_supported_instructions(&dockerfile, &mut image_config).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = empty_engine_paths(tmp.path());
+        let mut manifest = empty_manifest();
+        let (sender, _rx) = mpsc::channel();
+        apply_dockerfile_instructions(
+            &dockerfile,
+            tmp.path(),
+            &paths,
+            &mut image_config,
+            &mut manifest,
+            &sender,
+        )
+        .unwrap();
 
         let runtime = image_config.config().clone().unwrap();
         assert_eq!(
@@ -3655,6 +4181,7 @@ ENTRYPOINT ["/bin/demo"]
         assert_eq!(runtime.working_dir().clone().unwrap(), "/srv/app");
         assert_eq!(runtime.cmd().clone().unwrap(), vec!["echo", "hello"]);
         assert_eq!(runtime.entrypoint().clone().unwrap(), vec!["/bin/demo"]);
+        assert!(manifest.layers().is_empty());
     }
 
     #[test]
@@ -3679,10 +4206,146 @@ RUN apk add curl
         )
         .unwrap();
 
-        let error = apply_supported_instructions(&dockerfile, &mut image_config)
-            .unwrap_err()
-            .to_string();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = empty_engine_paths(tmp.path());
+        let mut manifest = empty_manifest();
+        let (sender, _rx) = mpsc::channel();
+        let error = apply_dockerfile_instructions(
+            &dockerfile,
+            tmp.path(),
+            &paths,
+            &mut image_config,
+            &mut manifest,
+            &sender,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("RUN"));
+    }
+
+    #[test]
+    fn copy_instruction_produces_layer_with_correct_digests() {
+        let ctx = tempfile::tempdir().unwrap();
+        fs::write(ctx.path().join("hello.txt"), b"hi\n").unwrap();
+        fs::create_dir_all(ctx.path().join("pkg")).unwrap();
+        fs::write(ctx.path().join("pkg/a.txt"), b"a").unwrap();
+        fs::write(ctx.path().join("pkg/b.txt"), b"bb").unwrap();
+        fs::write(
+            ctx.path().join("Dockerfile"),
+            r#"FROM alpine:3.20
+WORKDIR /srv
+COPY hello.txt ./
+COPY --chmod=0750 pkg /opt/pkg/
+"#,
+        )
+        .unwrap();
+
+        let dockerfile = Dockerfile::parse(
+            &fs::read_to_string(ctx.path().join("Dockerfile")).unwrap(),
+        )
+        .unwrap();
+
+        let store = tempfile::tempdir().unwrap();
+        let paths = empty_engine_paths(store.path());
+        let mut manifest = empty_manifest();
+        let mut image_config: ImageConfiguration = serde_json::from_str(
+            r#"{
+  "architecture": "amd64",
+  "os": "linux",
+  "rootfs": { "type": "layers", "diff_ids": [] }
+}"#,
+        )
+        .unwrap();
+        let (sender, _rx) = mpsc::channel();
+        apply_dockerfile_instructions(
+            &dockerfile,
+            ctx.path(),
+            &paths,
+            &mut image_config,
+            &mut manifest,
+            &sender,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.layers().len(), 2);
+        assert_eq!(image_config.rootfs().diff_ids().len(), 2);
+        for (layer, diff_id) in manifest
+            .layers()
+            .iter()
+            .zip(image_config.rootfs().diff_ids())
+        {
+            assert_eq!(layer.media_type(), &MediaType::ImageLayerGzip);
+            assert!(layer.digest().as_ref().starts_with("sha256:"));
+            assert!(diff_id.starts_with("sha256:"));
+            assert!(layer.size() > 0);
+            // Blob exists on disk.
+            let blob = digest_blob_path(&paths.blobs, layer.digest().as_ref()).unwrap();
+            assert!(blob.exists(), "missing blob {}", blob.display());
+        }
+
+        // Re-running with the same inputs should produce identical digests (determinism).
+        let mut manifest2 = empty_manifest();
+        let mut image_config2: ImageConfiguration = serde_json::from_str(
+            r#"{
+  "architecture": "amd64",
+  "os": "linux",
+  "rootfs": { "type": "layers", "diff_ids": [] }
+}"#,
+        )
+        .unwrap();
+        let store2 = tempfile::tempdir().unwrap();
+        let paths2 = empty_engine_paths(store2.path());
+        apply_dockerfile_instructions(
+            &dockerfile,
+            ctx.path(),
+            &paths2,
+            &mut image_config2,
+            &mut manifest2,
+            &sender,
+        )
+        .unwrap();
+        for (a, b) in manifest.layers().iter().zip(manifest2.layers()) {
+            assert_eq!(a.digest(), b.digest(), "layer digests must be deterministic");
+        }
+        assert_eq!(
+            image_config.rootfs().diff_ids(),
+            image_config2.rootfs().diff_ids()
+        );
+    }
+
+    #[test]
+    fn copy_rejects_traversal_sources() {
+        let ctx = tempfile::tempdir().unwrap();
+        fs::write(
+            ctx.path().join("Dockerfile"),
+            r#"FROM alpine:3.20
+COPY ../etc/passwd /tmp/p
+"#,
+        )
+        .unwrap();
+        let dockerfile = Dockerfile::parse(
+            &fs::read_to_string(ctx.path().join("Dockerfile")).unwrap(),
+        )
+        .unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let paths = empty_engine_paths(store.path());
+        let mut manifest = empty_manifest();
+        let mut image_config: ImageConfiguration = serde_json::from_str(
+            r#"{ "architecture": "amd64", "os": "linux", "rootfs": { "type": "layers", "diff_ids": [] } }"#,
+        )
+        .unwrap();
+        let (sender, _rx) = mpsc::channel();
+        let err = apply_dockerfile_instructions(
+            &dockerfile,
+            ctx.path(),
+            &paths,
+            &mut image_config,
+            &mut manifest,
+            &sender,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("inside the build context"), "got: {err}");
     }
 
     #[test]

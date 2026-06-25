@@ -28,6 +28,7 @@ cargo run
 
 - The native pull path does not require Docker Engine.
 - Public registry images work with anonymous auth today.
-- The native builder currently supports `FROM`, `ENV`, `LABEL`, `EXPOSE`, `USER`, `WORKDIR`, `CMD`, and `ENTRYPOINT`.
+- The native builder currently supports `FROM`, `ENV`, `LABEL`, `EXPOSE`, `USER`, `WORKDIR`, `CMD`, `ENTRYPOINT`, and `COPY` (including `--chown=<uid>:<gid>` and `--chmod=<octal>`, plus glob sources like `COPY pkg/*.json ./`).
+- `COPY` produces a real gzipped tar layer in the native blob store and updates the image manifest and config (`rootfs.diff_ids`) so the built image can be exported as an OCI archive and loaded by any other OCI tool.
 - Container execution currently uses a Docker Desktop runtime bridge for `run`, `start`, `stop`, and `logs`.
-- `RUN`, `COPY`, `ADD`, and multi-stage builds still need the next engine phase: a real rootfs executor and snapshotter.
+- `RUN`, `ADD`, and multi-stage builds still need the next engine phase: a real rootfs executor and snapshotter (`COPY` works today because it does not require executing code).
